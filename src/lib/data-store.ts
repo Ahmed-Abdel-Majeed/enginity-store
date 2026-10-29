@@ -1151,6 +1151,10 @@ export async function sendAssistantMessage(params: {
   message: string;
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
   lang?: Lang;
+  conversationId?: string;
+  sessionId?: string;
+  page?: string;
+  context?: string;
 }): Promise<AssistantResponsePayload> {
   if (typeof window !== 'undefined') {
     try {

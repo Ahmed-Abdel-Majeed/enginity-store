@@ -941,7 +941,11 @@ const assistantChatSchema = z.object({
       })
     )
     .optional(),
-  lang: z.enum(['ar', 'en']).default('ar')
+  lang: z.enum(['ar', 'en']).default('ar'),
+  conversationId: z.string().optional(),
+  sessionId: z.string().optional(),
+  page: z.string().optional(),
+  context: z.string().optional()
 });
 
 app.post('/api/assistant/chat', publicSubmissionRateLimiter, async (req: Request, res: Response) => {
@@ -950,7 +954,11 @@ app.post('/api/assistant/chat', publicSubmissionRateLimiter, async (req: Request
     const response = await processAssistantTurn({
       message: parsed.message,
       history: parsed.history,
-      lang: parsed.lang
+      lang: parsed.lang,
+      conversationId: parsed.conversationId,
+      sessionId: parsed.sessionId,
+      page: parsed.page,
+      context: parsed.context
     });
     return res.json({ response });
   } catch (err: any) {

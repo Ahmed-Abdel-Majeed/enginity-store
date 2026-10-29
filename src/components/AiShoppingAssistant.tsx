@@ -57,7 +57,30 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
   ]);
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
+  const [lastQuery, setLastQuery] = useState<string | null>(null);
   const messagesEndRef = useRef<HTMLDivElement>(null);
+
+  const [conversationId] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const existing = sessionStorage.getItem('enginity_conv_id');
+      if (existing) return existing;
+      const created = `conv_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      sessionStorage.setItem('enginity_conv_id', created);
+      return created;
+    }
+    return `conv_${Date.now()}`;
+  });
+
+  const [sessionId] = useState(() => {
+    if (typeof window !== 'undefined') {
+      const existing = sessionStorage.getItem('enginity_session_id');
+      if (existing) return existing;
+      const created = `sess_${Date.now()}_${Math.random().toString(36).substring(2, 7)}`;
+      sessionStorage.setItem('enginity_session_id', created);
+      return created;
+    }
+    return `sess_${Date.now()}`;
+  });
 
   useEffect(() => {
     setMessages(prev => {
@@ -92,6 +115,7 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
     const query = (textOverride ?? input).trim();
     if (!query || loading) return;
 
+    setLastQuery(query);
     const userMsg: AssistantChatMessage = {
       id: `user-${Date.now()}`,
       role: 'user',
@@ -113,7 +137,11 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
       const payload = await sendAssistantMessage({
         message: query,
         history: historyForApi,
-        lang
+        lang,
+        conversationId,
+        sessionId,
+        page: typeof window !== 'undefined' ? window.location.pathname : '',
+        context: 'ENGINITY Marketplace AI Agent (agent-enginity-store)'
       });
 
       const assistantMsg: AssistantChatMessage = {
@@ -132,8 +160,8 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
           id: `err-${Date.now()}`,
           role: 'assistant',
           content: isAr
-            ? 'عذراً، حدث خطأ مؤقت أثناء الاتصال بالمساعد. يمكنك تصفح المنتجات مباشرة أو طلب نظام أتمتة مخصص بالأسفل.'
-            : 'Sorry, a temporary error occurred. You can browse products directly or request a custom automation system below.',
+            ? 'عذراً، حدث خطأ مؤقت أثناء الاتصال بالمساعد أو الشبكة. يمكنك إعادة المحاولة بالضغط على زر إعادة المحاولة أدناه.'
+            : 'Sorry, a temporary connection or network error occurred. You can retry sending your message below.',
           timestamp: new Date().toISOString()
         }
       ]);
@@ -348,6 +376,20 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
                     >
                       {msg.content}
                     </div>
+
+                    {msg.id.startsWith('err-') && lastQuery && (
+                      <button
+                        type="button"
+                        onClick={() => {
+                          setMessages(prev => prev.filter(m => m.id !== msg.id));
+                          handleSend(lastQuery);
+                        }}
+                        className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-xl bg-red-500/20 hover:bg-red-500/30 border border-red-500/40 text-red-300 text-[11px] font-semibold transition-colors"
+                      >
+                        <RotateCcw className="w-3 h-3" />
+                        <span>{isAr ? 'إعادة محاولة إرسال الرسالة' : 'Retry sending message'}</span>
+                      </button>
+                    )}
 
                     {/* Clarifying Questions */}
                     {!isUser && clarifyingList && clarifyingList.length > 0 && (

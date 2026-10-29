@@ -536,6 +536,10 @@ export async function processAssistantTurn(params: {
   lang?: Lang;
   catalogOverride?: Product[];
   simulateProviderOutage?: boolean;
+  conversationId?: string;
+  sessionId?: string;
+  page?: string;
+  context?: string;
 }): Promise<AssistantResponsePayload> {
   const userMessage = (params.message || '').trim().slice(0, 1500);
   const lang: Lang = params.lang === 'en' ? 'en' : 'ar';
@@ -572,13 +576,15 @@ export async function processAssistantTurn(params: {
     return runCatalogIntelligenceEngine(userMessage, catalog, lang);
   }
 
-  // Step 3: Optional n8n AI Agent Webhook (server-side only)
+  // Step 3: n8n AI Agent Webhook (server-side proxy)
   const n8nAssistantUrl =
-    typeof process !== 'undefined' ? process.env.N8N_ASSISTANT_WEBHOOK_URL : undefined;
+    (typeof process !== 'undefined' && process.env.N8N_ASSISTANT_WEBHOOK_URL) ||
+    'https://n8n-enginity.duckdns.org/webhook/agent-enginity-store';
+
   if (n8nAssistantUrl && n8nAssistantUrl.startsWith('https://')) {
     try {
       const controller = new AbortController();
-      const timeout = setTimeout(() => controller.abort(), 6500);
+      const timeout = setTimeout(() => controller.abort(), 8000);
       const res = await fetch(n8nAssistantUrl, {
         method: 'POST',
         headers: {
@@ -589,7 +595,11 @@ export async function processAssistantTurn(params: {
         },
         body: JSON.stringify({
           message: userMessage,
-          lang,
+          conversationId: params.conversationId || '',
+          sessionId: params.sessionId || '',
+          locale: lang,
+          page: params.page || '',
+          context: params.context || 'Enginity Marketplace Customer Support',
           history: (params.history || []).slice(-6),
           catalog: catalog.map(p => ({
             id: p.id,
@@ -609,15 +619,33 @@ export async function processAssistantTurn(params: {
       clearTimeout(timeout);
 
       if (res.ok) {
-        const json = await res.json();
-        if (json && (json.reply_ar || json.reply_en)) {
+        const textBody = await res.text();
+        let json: any = null;
+        try {
+          json = JSON.parse(textBody);
+        } catch {
+          json = { reply: textBody };
+        }
+
+        const rawReply =
+          json?.reply ||
+          json?.output ||
+          json?.text ||
+          json?.message ||
+          json?.response ||
+          json?.reply_ar ||
+          json?.reply_en ||
+          (typeof json === 'string' ? json : '');
+
+        if (rawReply && typeof rawReply === 'string' && rawReply.trim() !== '') {
           const verifiedRecs = validateRecommendationsAgainstCatalog(
             json.recommendations || [],
             catalog
           );
+          const replyText = rawReply.trim();
           return {
-            reply_ar: json.reply_ar || json.reply_en,
-            reply_en: json.reply_en || json.reply_ar,
+            reply_ar: json.reply_ar || replyText,
+            reply_en: json.reply_en || replyText,
             clarifying_questions_ar: Array.isArray(json.clarifying_questions_ar)
               ? json.clarifying_questions_ar
               : undefined,
@@ -634,7 +662,7 @@ export async function processAssistantTurn(params: {
         }
       }
     } catch (err) {
-      console.warn('n8n assistant webhook unreachable, falling back to Gemini / Catalog engine:', err);
+      console.warn('n8n agent webhook unreachable or failed, falling back to Gemini / Catalog engine:', err);
     }
   }
 

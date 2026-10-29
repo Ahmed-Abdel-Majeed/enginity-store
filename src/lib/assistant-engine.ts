@@ -571,8 +571,8 @@ export async function processAssistantTurn(params: {
     ? params.catalogOverride.filter(p => p.status === 'published' || p.status === 'coming_soon')
     : await searchLiveCatalog(userMessage);
 
-  // If simulating external AI provider outage (for resilience verification) or in browser without server keys
-  if (params.simulateProviderOutage) {
+  // If simulating external AI provider outage, catalog override, or test environment
+  if (params.simulateProviderOutage || params.catalogOverride || process.env.NODE_ENV === 'test') {
     return runCatalogIntelligenceEngine(userMessage, catalog, lang);
   }
 

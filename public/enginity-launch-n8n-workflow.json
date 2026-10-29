@@ -1,0 +1,157 @@
+{
+  "name": "ENGINITY Store - Product Launch Email Dispatcher",
+  "nodes": [
+    {
+      "parameters": {
+        "httpMethod": "POST",
+        "path": "send-email-from-user-product-publish",
+        "responseMode": "onReceived",
+        "responseData": "allEntries",
+        "options": {}
+      },
+      "id": "node-webhook-trigger",
+      "name": "ENGINITY Webhook Receiver",
+      "type": "n8n-nodes-base.webhook",
+      "typeVersion": 2,
+      "position": [
+        220,
+        300
+      ],
+      "webhookId": "send-email-from-user-product-publish"
+    },
+    {
+      "parameters": {
+        "jsCode": "// Extract payload from Webhook\nconst payload = $input.first().json.body || $input.first().json;\nconst product = payload.product || {};\nconst subscribers = payload.subscribers || [];\n\nconst outputItems = [];\n\nfor (const sub of subscribers) {\n  if (sub.email_consent && sub.email && sub.email.trim() !== '') {\n    outputItems.push({\n      json: {\n        subscriber_id: sub.id,\n        email: sub.email.trim(),\n        whatsapp_number: sub.whatsapp_number || '',\n        email_consent: sub.email_consent,\n        whatsapp_consent: sub.whatsapp_consent,\n        product_id: product.id || '',\n        product_slug: product.slug || '',\n        product_name_ar: product.name_ar || 'منتج جديد من ENGINITY',\n        product_name_en: product.name_en || 'New ENGINITY Product',\n        product_price: product.price_egp || 0,\n        cover_path: product.cover_path || '',\n        product_url: product.product_url || 'https://enginity-store-s8dx.vercel.app',\n        launch_announcement: product.launch_announcement || '',\n        launched_at: payload.timestamp || new Date().toISOString()\n      }\n    });\n  }\n}\n\nif (outputItems.length === 0) {\n  return [{ json: { notice: 'No email consented subscribers found in launch payload.' } }];\n}\n\nreturn outputItems;"
+      },
+      "id": "node-code-filter",
+      "name": "Extract & Filter Email Subscribers",
+      "type": "n8n-nodes-base.code",
+      "typeVersion": 2,
+      "position": [
+        460,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "batchSize": 1,
+        "options": {}
+      },
+      "id": "node-loop-items",
+      "name": "Loop Over Subscribers",
+      "type": "n8n-nodes-base.splitInBatches",
+      "typeVersion": 3,
+      "position": [
+        700,
+        300
+      ]
+    },
+    {
+      "parameters": {
+        "resource": "message",
+        "operation": "send",
+        "sendTo": "={{ $json.email }}",
+        "subject": "⚡ تم إطلاق المنتج: ={{ $json.product_name_ar }}",
+        "messageType": "html",
+        "message": "=<div style=\"font-family: 'Cairo', 'Segoe UI', sans-serif; direction: rtl; text-align: right; background-color: #0b1f3a; color: #f8fafc; padding: 30px; border-radius: 20px; max-width: 600px; margin: 0 auto;\">\n  <div style=\"text-align: center; margin-bottom: 20px;\">\n    <h1 style=\"color: #2f6bff; margin: 0; font-size: 24px;\">ENGINITY AUTOMATION</h1>
+    <p style="color: #94a3b8; font-size: 13px;">تنبيه إطلاق المنتجات القادمة 🚀</p>\n  </div>\n\n  <div style=\"background-color: #122b52; border: 1px solid #23477e; padding: 20px; border-radius: 16px; margin-bottom: 24px;\">\n    <h2 style=\"color: #ffffff; font-size: 18px; margin-top: 0;\">⚡ {{ $json.product_name_ar }}</h2>\n    {{#if $json.cover_path}}<img src=\"{{ $json.cover_path }}\" alt=\"{{ $json.product_name_ar }}\" style=\"width: 100%; max-height: 250px; object-fit: cover; border-radius: 12px; margin-bottom: 15px;\" />{{/if}}\n    {{#if $json.launch_announcement}}<p style=\"background-color: #1e3a8a; border-right: 4px solid #3b82f6; padding: 12px; border-radius: 8px; font-size: 14px; color: #93c5fd;\"><strong>ملاحظة الإطلاق:</strong> {{ $json.launch_announcement }}</p>{{/if}}\n    <p style=\"font-size: 14px; color: #cbd5e1; line-height: 1.6;\">يسرنا إعلامك بأنه تم رسمياً مراجعة وإطلاق هذا الـ Workflow وهو متاح الآن للاستيراد المباشر والشراء عبر المتجر.</p>\n    <div style=\"text-align: center; margin-top: 25px;\">\n      <a href=\"{{ $json.product_url }}\" target=\"_blank\" style=\"background-color: #2f6bff; color: #ffffff; padding: 14px 32px; text-decoration: none; font-weight: bold; font-size: 15px; border-radius: 12px; display: inline-block; box-shadow: 0 4px 12px rgba(47, 107, 255, 0.4);\">معاينة وشراء الـ Workflow الآن ⚡</a>\n    </div>\n  </div>\n\n  <div style=\"text-align: center; font-size: 11px; color: #64748b;\">\n    وصلتك هذه الرسالة لأنك قمت بطلب التنبيه عند إطلاق هذا المنتج على متجر Enginity Store.<br/>\n    جميع الحقوق محفوظة © Enginity Store {{ $now.format('yyyy') }}\n  </div>\n</div>",
+        "options": {}
+      },
+      "id": "node-send-email",
+      "name": "Send Gmail Notification",
+      "type": "n8n-nodes-base.gmail",
+      "typeVersion": 2.1,
+      "position": [
+        940,
+        300
+      ],
+      "credentials": {
+        "gmailOAuth2": {
+          "id": "1",
+          "name": "Gmail Account"
+        }
+      }
+    },
+    {
+      "parameters": {
+        "amount": 1,
+        "unit": "seconds"
+      },
+      "id": "node-wait-delay",
+      "name": "Wait 1s Throttle",
+      "type": "n8n-nodes-base.wait",
+      "typeVersion": 1.1,
+      "position": [
+        1180,
+        300
+      ]
+    }
+  ],
+  "connections": {
+    "ENGINITY Webhook Receiver": {
+      "main": [
+        [
+          {
+            "node": "Extract & Filter Email Subscribers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Extract & Filter Email Subscribers": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Subscribers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Loop Over Subscribers": {
+      "main": [
+        [
+          {
+            "node": "Send Gmail Notification",
+            "type": "main",
+            "index": 0
+          }
+        ],
+        []
+      ]
+    },
+    "Send Gmail Notification": {
+      "main": [
+        [
+          {
+            "node": "Wait 1s Throttle",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    },
+    "Wait 1s Throttle": {
+      "main": [
+        [
+          {
+            "node": "Loop Over Subscribers",
+            "type": "main",
+            "index": 0
+          }
+        ]
+      ]
+    }
+  },
+  "settings": {
+    "executionOrder": "v1"
+  },
+  "staticData": null,
+  "tags": [
+    {
+      "name": "ENGINITY"
+    }
+  ]
+}

@@ -58,6 +58,7 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
   const [input, setInput] = useState('');
   const [loading, setLoading] = useState(false);
   const [lastQuery, setLastQuery] = useState<string | null>(null);
+  const inFlightRef = useRef(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
 
   const [conversationId] = useState(() => {
@@ -113,8 +114,9 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
 
   const handleSend = async (textOverride?: string) => {
     const query = (textOverride ?? input).trim();
-    if (!query || loading) return;
+    if (!query || loading || inFlightRef.current) return;
 
+    inFlightRef.current = true;
     setLastQuery(query);
     const userMsg: AssistantChatMessage = {
       id: `user-${Date.now()}`,
@@ -166,6 +168,7 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
         }
       ]);
     } finally {
+      inFlightRef.current = false;
       setLoading(false);
     }
   };
@@ -365,6 +368,7 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
                 return (
                   <div
                     key={msg.id}
+                    data-route={payload?.route}
                     className={`flex flex-col ${isUser ? 'items-end' : 'items-start'} space-y-2.5`}
                   >
                     <div
@@ -414,6 +418,21 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
                       payload.recommendations.length > 0 && (
                         <div className="w-full max-w-[94%] space-y-2.5">
                           {payload.recommendations.map(rec => renderRecommendationCard(rec))}
+                          <button
+                            type="button"
+                            onClick={() =>
+                              handleSend(
+                                isAr
+                                  ? 'ولا نظام من دول مناسب لاحتياجي'
+                                  : 'None of these are suitable for my needs'
+                              )
+                            }
+                            className="w-full py-1.5 px-3 rounded-lg bg-slate-900/80 hover:bg-slate-800 border border-slate-800 text-[11px] text-slate-400 hover:text-slate-200 transition-colors text-center"
+                          >
+                            {isAr
+                              ? 'ولا نظام من دول مناسب لاحتياجي — أريد حلاً مخصصاً'
+                              : 'None of these fit my needs — I want a custom solution'}
+                          </button>
                         </div>
                       )}
 

@@ -258,6 +258,25 @@ export type AssistantActionType =
   | 'suggest_product'
   | 'contact_human_support';
 
+export type AssistantRouteType =
+  | 'catalog'
+  | 'clarification'
+  | 'general_agent'
+  | 'no_match'
+  | 'security_refusal'
+  | 'catalog_error';
+
+export interface AssistantRoutingTrace {
+  route: AssistantRouteType;
+  reason: string;
+  supabaseQueried: boolean;
+  supabaseError?: boolean;
+  n8nCalled: boolean;
+  n8nCallCount: number;
+  matchedProductSlugs: string[];
+  matchConfidence?: 'strong' | 'partial' | 'none';
+}
+
 export interface AssistantResponsePayload {
   reply_ar: string;
   reply_en: string;
@@ -273,6 +292,8 @@ export interface AssistantResponsePayload {
     prefill_topic?: string;
   }[];
   source_mode?: 'gemini_agent' | 'n8n_agent' | 'catalog_intelligence';
+  route?: AssistantRouteType;
+  routing_trace?: AssistantRoutingTrace;
 }
 
 export interface AssistantChatMessage {
@@ -282,4 +303,5 @@ export interface AssistantChatMessage {
   timestamp: string;
   payload?: AssistantResponsePayload;
 }
+
 

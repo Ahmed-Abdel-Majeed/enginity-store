@@ -120,10 +120,12 @@ export async function fetchProducts(options?: {
   publishedOnly?: boolean;
   categoryId?: number;
   searchQuery?: string;
+  throwOnError?: boolean;
 }): Promise<Product[]> {
   const publishedOnly = options?.publishedOnly ?? true;
   const categoryId = options?.categoryId;
   const searchQuery = options?.searchQuery?.toLowerCase().trim();
+  const throwOnError = options?.throwOnError ?? false;
 
   if (isSupabaseConfigured() && supabase) {
     let query = supabase.from('products').select('*');
@@ -134,7 +136,13 @@ export async function fetchProducts(options?: {
       query = query.eq('category_id', categoryId);
     }
     const { data, error } = await query.order('sort_order', { ascending: true });
-    if (!error && data) {
+    if (error) {
+      if (throwOnError) {
+        throw new Error(`Supabase products query failed: ${error.message}`);
+      }
+      return [];
+    }
+    if (data) {
       let result: Product[] = data;
       if (searchQuery) {
         result = result.filter(
@@ -148,6 +156,8 @@ export async function fetchProducts(options?: {
       }
       return result;
     }
+  } else if (throwOnError) {
+    throw new Error('Supabase client is not configured.');
   }
 
   return [];
@@ -1147,6 +1157,8 @@ export async function updateAdminProductSuggestion(
 // FEATURE A: INTELLIGENT AI SHOPPING ASSISTANT CLIENT WRAPPER
 // ============================================================================
 
+const inFlightAssistantRequests = new Map<string, Promise<AssistantResponsePayload>>();
+
 export async function sendAssistantMessage(params: {
   message: string;
   history?: Array<{ role: 'user' | 'assistant'; content: string }>;
@@ -1156,24 +1168,18 @@ export async function sendAssistantMessage(params: {
   page?: string;
   context?: string;
 }): Promise<AssistantResponsePayload> {
-  if (typeof window !== 'undefined') {
-    try {
-      const res = await fetch('/api/assistant/chat', {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify(params)
-      });
-      if (res.ok) {
-        const json = await res.json();
-        if (json && json.response) {
-          return json.response;
-        }
-      }
-    } catch (err) {
-      console.warn('sendAssistantMessage API unreachable, falling back to local catalog intelligence:', err);
-    }
+  const dedupeKey = `${params.sessionId || params.conversationId || 'default'}::${(params.message || '').trim()}`;
+  const existing = inFlightAssistantRequests.get(dedupeKey);
+  if (existing) {
+    return existing;
   }
 
-  return await processAssistantTurn(params);
+  const task = processAssistantTurn(params).finally(() => {
+    inFlightAssistantRequests.delete(dedupeKey);
+  });
+
+  inFlightAssistantRequests.set(dedupeKey, task);
+  return await task;
 }
+
 

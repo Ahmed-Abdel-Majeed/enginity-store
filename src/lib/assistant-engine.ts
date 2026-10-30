@@ -7,6 +7,7 @@ import {
   Product
 } from '../types';
 import { fetchProducts } from './data-store';
+import { resolveProductPricing } from './utils';
 
 const SITE_BASE_URL = (
   (typeof process !== 'undefined' && (process.env.SITE_URL || process.env.NEXT_PUBLIC_SITE_URL)) ||
@@ -141,15 +142,23 @@ export function buildVerifiedRecommendation(
   const toolsTextAr = (product.tools || []).join('، ');
   const toolsTextEn = (product.tools || []).join(', ');
 
+  const pricing = resolveProductPricing(product);
+  const priceTextAr = pricing.hasDiscount
+    ? `${pricing.effectivePriceEgp} ج.م بدلاً من ${pricing.originalPriceEgp} ج.م (خصم ${pricing.discountPercentage}%)`
+    : `${pricing.effectivePriceEgp} ج.م`;
+  const priceTextEn = pricing.hasDiscount
+    ? `${pricing.effectivePriceEgp} EGP instead of ${pricing.originalPriceEgp} EGP (${pricing.discountPercentage}% OFF)`
+    : `${pricing.effectivePriceEgp} EGP`;
+
   const defaultReasonAr =
     status === 'published'
-      ? `${product.short_ar || product.name_ar} — متاح للشراء والتحميل الفوري بسعر ${product.price_egp} ج.م${toolsTextAr ? ` (يعمل باستخدام: ${toolsTextAr})` : ''}.`
-      : `${product.short_ar || product.name_ar} — قريباً في المتجر (Coming Soon) بسعر متوقع ${product.price_egp} ج.م. يمكنك الانضمام لقائمة الانتظار ليصلك تنبيه فور إطلاقه.`;
+      ? `${product.short_ar || product.name_ar} — متاح للشراء والتحميل الفوري بسعر ${priceTextAr}${toolsTextAr ? ` (يعمل باستخدام: ${toolsTextAr})` : ''}.`
+      : `${product.short_ar || product.name_ar} — قريباً في المتجر (Coming Soon) بسعر متوقع ${priceTextAr}. يمكنك الانضمام لقائمة الانتظار ليصلك تنبيه فور إطلاقه.`;
 
   const defaultReasonEn =
     status === 'published'
-      ? `${product.short_en || product.name_en} — Available for instant purchase & download at ${product.price_egp} EGP${toolsTextEn ? ` (powered by: ${toolsTextEn})` : ''}.`
-      : `${product.short_en || product.name_en} — Coming Soon (expected price ${product.price_egp} EGP). You can join the waitlist to get notified the moment it launches.`;
+      ? `${product.short_en || product.name_en} — Available for instant purchase & download at ${priceTextEn}${toolsTextEn ? ` (powered by: ${toolsTextEn})` : ''}.`
+      : `${product.short_en || product.name_en} — Coming Soon (expected price ${priceTextEn}). You can join the waitlist to get notified the moment it launches.`;
 
   const reqNamesAr = (product.requirements_ar || []).map(r => r.name).filter(Boolean);
   const reqNamesEn = (product.requirements_en || []).map(r => r.name).filter(Boolean);
@@ -171,7 +180,10 @@ export function buildVerifiedRecommendation(
     name_en: product.name_en,
     short_ar: product.short_ar || product.name_ar,
     short_en: product.short_en || product.name_en,
-    price_egp: Number(product.price_egp) || 0,
+    price_egp: pricing.effectivePriceEgp,
+    original_price_egp: pricing.originalPriceEgp,
+    sale_price_egp: pricing.salePriceEgp,
+    discount_percentage: pricing.discountPercentage,
     status,
     waitlist_enabled: product.waitlist_enabled ?? true,
     level: product.level || 'intermediate',

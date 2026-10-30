@@ -26,7 +26,12 @@ import {
   createProductSuggestion,
   listProductSuggestions,
   updateProductSuggestion,
-  computeDemandAnalytics
+  computeDemandAnalytics,
+  createProductReview,
+  getProductReviewsAndSummary,
+  listAdminProductReviews,
+  moderateProductReview,
+  deleteProductReview
 } from './src/lib/crm-store';
 import { processAssistantTurn } from './src/lib/assistant-engine';
 import { validateXPayUrl, normalizeDateToIso } from './src/lib/utils';
@@ -483,6 +488,8 @@ const productInputSchema = z.object({
   status: z.enum(['draft', 'published', 'coming_soon', 'archived']),
   category_id: z.coerce.number(),
   price_egp: z.coerce.number().min(0),
+  original_price_egp: z.coerce.number().min(0).nullable().optional(),
+  sale_price_egp: z.coerce.number().min(0).nullable().optional(),
   xpay_url: nullableString.refine(url => !url || validateXPayUrl(url), {
     message: 'xpay_url must be a valid https URL (and match XPAY_ALLOWED_HOSTS if set).'
   }),
@@ -1133,6 +1140,103 @@ app.put('/api/admin/product-suggestions/:id', adminRateLimiter, requireAdmin, as
       return res.status(400).json({ error: 'Invalid suggestion update payload.' });
     }
     return res.status(500).json({ error: 'Failed to update product suggestion.' });
+  }
+});
+
+// Feature D: Product Ratings & Customer Reviews (Public + Admin Moderation)
+const productReviewCreateSchema = z.object({
+  product_id: z.string().min(1),
+  customer_name: z.string().min(2).max(100),
+  rating: z.number().int().min(1).max(5),
+  review_text: z.string().max(2000).nullable().optional(),
+  lang: z.enum(['ar', 'en']).optional()
+});
+
+app.get('/api/reviews/:productId', async (req: Request, res: Response) => {
+  try {
+    const productId = req.params.productId;
+    const result = await getProductReviewsAndSummary(productId);
+    return res.json(result);
+  } catch (err: any) {
+    return res.status(500).json({ error: 'Failed to fetch product reviews.' });
+  }
+});
+
+app.post('/api/reviews', publicSubmissionRateLimiter, async (req: Request, res: Response) => {
+  try {
+    const parsed = productReviewCreateSchema.parse(req.body);
+    const result = await createProductReview(parsed);
+    if (!result.success) {
+      return res.status(400).json({ error: result.message });
+    }
+    return res.status(result.duplicate ? 200 : 201).json({
+      success: true,
+      duplicate: result.duplicate,
+      message: result.message,
+      review: result.review
+    });
+  } catch (err: any) {
+    if (err instanceof z.ZodError) {
+      return res.status(400).json({ error: err.issues[0]?.message || 'Invalid review fields.' });
+    }
+    return res.status(500).json({ error: 'Failed to submit product review.' });
+  }
+});
+
+app.get('/api/admin/reviews', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const statusParam = req.query.status ? String(req.query.status) : 'all';
+    const productIdParam = req.query.productId ? String(req.query.productId) : undefined;
+    const status =
+      statusParam === 'pending' || statusParam === 'approved' || statusParam === 'rejected'
+        ? statusParam
+        : 'all';
+    const result = await listAdminProductReviews({
+      status,
+      productId: productIdParam,
+      isServerAuthorized: true
+    });
+    return res.json({ reviews: result.reviews });
+  } catch {
+    return res.status(500).json({ error: 'Failed to load admin product reviews.' });
+  }
+});
+
+const productReviewModerateSchema = z.object({
+  status: z.enum(['pending', 'approved', 'rejected'])
+});
+
+app.put('/api/admin/reviews/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id;
+    const parsed = productReviewModerateSchema.parse(req.body);
+    const result = await moderateProductReview(id, parsed.status, {
+      isServerAuthorized: true
+    });
+    if (!result.success) {
+      return res.status(404).json({ error: result.message || 'Review not found.' });
+    }
+    return res.json({ success: true, review: result.review });
+  } catch (err: any) {
+    if (err instanceof z.ZodError) {
+      return res.status(400).json({ error: 'Invalid review status.' });
+    }
+    return res.status(500).json({ error: 'Failed to update review status.' });
+  }
+});
+
+app.delete('/api/admin/reviews/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
+  try {
+    const id = req.params.id;
+    const result = await deleteProductReview(id, {
+      isServerAuthorized: true
+    });
+    if (!result.success) {
+      return res.status(404).json({ error: result.message || 'Review not found.' });
+    }
+    return res.json({ success: true });
+  } catch {
+    return res.status(500).json({ error: 'Failed to delete review.' });
   }
 });
 

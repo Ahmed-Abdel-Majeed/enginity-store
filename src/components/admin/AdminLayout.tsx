@@ -6,12 +6,14 @@ import {
   LogOut,
   ExternalLink,
   Wrench,
-  Lightbulb
+  Lightbulb,
+  Star
 } from 'lucide-react';
 
 export type AdminTabType =
   | 'products'
   | 'categories'
+  | 'reviews'
   | 'custom-requests'
   | 'product-suggestions'
   | 'settings'
@@ -24,6 +26,7 @@ interface AdminLayoutProps {
     tab:
       | 'products'
       | 'categories'
+      | 'reviews'
       | 'custom-requests'
       | 'product-suggestions'
       | 'settings'
@@ -95,6 +98,18 @@ export const AdminLayout: React.FC<AdminLayoutProps> = ({
           >
             <Package className="w-4 h-4" />
             <span>المنتجات (Products)</span>
+          </button>
+
+          <button
+            onClick={() => onSelectTab('reviews')}
+            className={`shrink-0 md:w-full px-4 py-3 min-h-[44px] rounded-xl font-semibold text-xs flex items-center gap-2.5 transition-colors text-start cursor-pointer whitespace-nowrap ${
+              currentTab === 'reviews'
+                ? 'bg-blue-600 text-white shadow-md'
+                : 'bg-slate-800/80 hover:bg-slate-800 text-slate-300'
+            }`}
+          >
+            <Star className="w-4 h-4" />
+            <span>التقييمات والمراجعات (Reviews)</span>
           </button>
 
           <button

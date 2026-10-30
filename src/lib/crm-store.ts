@@ -4,16 +4,20 @@ import {
   DemandAnalyticsSummary,
   DemandIdeaGroup,
   Lang,
+  ProductRatingSummary,
+  ProductReview,
+  ProductReviewStatus,
   ProductSuggestion,
   ProductSuggestionStatus,
   PurchaseLikelihood
 } from '../types';
-import { getSystemAdminSupabase } from './supabase';
-import { normalizePhoneNumber } from './utils';
+import { getSupabaseAdmin, getSystemAdminSupabase, supabase } from './supabase';
+import { computeProductRatingSummary, normalizePhoneNumber } from './utils';
 
 const PRIVATE_CRM_BUCKET = 'private-crm';
 const CUSTOM_REQUESTS_FILE = 'custom_requests.json';
 const PRODUCT_SUGGESTIONS_FILE = 'product_suggestions.json';
+const PRODUCT_REVIEWS_FILE = 'product_reviews.json';
 
 function generateUuid(): string {
   if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
@@ -847,6 +851,10 @@ export async function cleanupSyntheticTestRecords(): Promise<void> {
       .from('product_suggestions')
       .delete()
       .ilike('email', '%@enginity.test');
+    await adminSb
+      .from('product_reviews')
+      .delete()
+      .ilike('customer_name', '%[TEST_SYNTHETIC]%');
   } catch {
     // Ignore if SQL tables not created yet
   }
@@ -859,5 +867,595 @@ export async function cleanupSyntheticTestRecords(): Promise<void> {
   const sugs = await readPrivateJsonList<ProductSuggestion>(adminSb, PRODUCT_SUGGESTIONS_FILE);
   const cleanedSugs = sugs.filter(s => !(s.email && s.email.endsWith('@enginity.test')));
   await writePrivateJsonList(adminSb, PRODUCT_SUGGESTIONS_FILE, cleanedSugs);
+
+  const revs = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
+  const cleanedRevs = revs.filter(r => !r.customer_name.includes('[TEST_SYNTHETIC]'));
+  await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, cleanedRevs);
 }
+
+// ============================================================================
+// FEATURE D: PRODUCT RATINGS & CUSTOMER REVIEWS (WITH MODERATION)
+// ============================================================================
+
+export interface SubmitProductReviewInput {
+  product_id: string;
+  customer_name: string;
+  rating: number;
+  review_text?: string | null;
+  lang?: Lang;
+  // Any client-supplied status is ignored to prevent privilege escalation
+  status?: any;
+}
+
+const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+
+export async function verifyAdminCallerAuthorization(options?: {
+  token?: string;
+  isServerAuthorized?: boolean;
+  requireAuthCheck?: boolean;
+}): Promise<boolean> {
+  if (options?.isServerAuthorized === true) {
+    return true;
+  }
+
+  const requireAuth = options?.requireAuthCheck ?? false;
+  let token = options?.token || '';
+
+  if (!token && typeof window !== 'undefined') {
+    try {
+      token = localStorage.getItem('enginity_sb_token') || '';
+    } catch {
+      // ignore
+    }
+  }
+
+  if (token) {
+    const client = getSupabaseAdmin(token);
+    if (client) {
+      try {
+        const { data: userData, error: userErr } = await client.auth.getUser(token);
+        if (!userErr && userData?.user) {
+          const { data: adminRow, error: adminErr } = await client
+            .from('admins')
+            .select('user_id')
+            .eq('user_id', userData.user.id)
+            .single();
+          if (!adminErr && adminRow) return true;
+        }
+      } catch {
+        // invalid token
+      }
+    }
+    return false;
+  }
+
+  if (typeof window !== 'undefined' && supabase) {
+    try {
+      const { data: sessionData } = await supabase.auth.getSession();
+      const user = sessionData?.session?.user;
+      if (user) {
+        const { data: adminRow, error: adminErr } = await supabase
+          .from('admins')
+          .select('user_id')
+          .eq('user_id', user.id)
+          .single();
+        if (!adminErr && adminRow) return true;
+      }
+    } catch {
+      // ignore
+    }
+  }
+
+  if (requireAuth) {
+    return false;
+  }
+
+  return false;
+}
+
+export async function createProductReview(
+  input: SubmitProductReviewInput
+): Promise<{
+  success: boolean;
+  duplicate?: boolean;
+  review?: ProductReview;
+  message: string;
+}> {
+  const lang: Lang = input.lang === 'en' ? 'en' : 'ar';
+  const productId = String(input.product_id || '').trim();
+  const customerName = String(input.customer_name || '').trim();
+  const rawRating = Number(input.rating);
+  const reviewText =
+    input.review_text !== undefined && input.review_text !== null
+      ? String(input.review_text).trim()
+      : '';
+
+  if (!productId || !UUID_REGEX.test(productId)) {
+    return {
+      success: false,
+      message:
+        lang === 'ar'
+          ? 'معرّف المنتج غير صالح.'
+          : 'Invalid product identifier.'
+    };
+  }
+
+  if (customerName.length < 2 || customerName.length > 100) {
+    return {
+      success: false,
+      message:
+        lang === 'ar'
+          ? 'يرجى إدخال اسمك بشكل صحيح (من حرفين إلى 100 حرف).'
+          : 'Please enter a valid customer name (2 to 100 characters).'
+    };
+  }
+
+  if (!Number.isInteger(rawRating) || rawRating < 1 || rawRating > 5) {
+    return {
+      success: false,
+      message:
+        lang === 'ar'
+          ? 'يرجى اختيار تقييم صحيح بين نجمة واحدة و5 نجوم.'
+          : 'Please select a valid star rating between 1 and 5.'
+    };
+  }
+
+  if (reviewText.length > 2000) {
+    return {
+      success: false,
+      message:
+        lang === 'ar'
+          ? 'نص التقييم طويل جداً (الحد الأقصى 2000 حرف).'
+          : 'Review text is too long (maximum 2000 characters).'
+    };
+  }
+
+  const adminSb = await getSystemAdminSupabase();
+  if (!adminSb) {
+    return {
+      success: false,
+      message:
+        lang === 'ar'
+          ? 'تعذر الاتصال بقاعدة البيانات حالياً. يرجى المحاولة لاحقاً.'
+          : 'Database connection unavailable. Please try again later.'
+    };
+  }
+
+  // Verify product exists in public.products
+  try {
+    const { data: prodRow, error: prodErr } = await adminSb
+      .from('products')
+      .select('id, status')
+      .eq('id', productId)
+      .maybeSingle();
+
+    if (!prodErr && !prodRow) {
+      return {
+        success: false,
+        message:
+          lang === 'ar'
+            ? 'المنتج المطلوب تقييمه غير موجود.'
+            : 'The specified product does not exist.'
+      };
+    }
+  } catch {
+    // Allow proceeding if products lookup encounters transient error
+  }
+
+  const nowIso = new Date().toISOString();
+  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
+
+  // Enforce status = 'pending' regardless of client payload
+  const forcedStatus: ProductReviewStatus = 'pending';
+
+  // Tier 1: Try native SQL table `product_reviews`
+  const { data: existingSql, error: checkSqlErr } = await adminSb
+    .from('product_reviews')
+    .select('*')
+    .eq('product_id', productId)
+    .gte('created_at', tenMinutesAgo);
+
+  if (!checkSqlErr && existingSql) {
+    const dup = existingSql.find(
+      (r: any) =>
+        String(r.customer_name || '').trim().toLowerCase() === customerName.toLowerCase() &&
+        Number(r.rating) === rawRating &&
+        String(r.review_text || '').trim() === reviewText
+    );
+    if (dup) {
+      return {
+        success: true,
+        duplicate: true,
+        review: dup as ProductReview,
+        message:
+          lang === 'ar'
+            ? 'تم استلام تقييمك بالفعل وهو قيد المراجعة حالياً. شكراً لمشاركتك!'
+            : 'Your review has already been received and is pending moderation. Thank you!'
+      };
+    }
+
+    const { data: insertedSql, error: insertSqlErr } = await adminSb
+      .from('product_reviews')
+      .insert({
+        product_id: productId,
+        customer_name: customerName,
+        rating: rawRating,
+        review_text: reviewText || null,
+        status: forcedStatus
+      })
+      .select('*')
+      .single();
+
+    if (!insertSqlErr && insertedSql) {
+      // Also mirror into storage list for consistency
+      const list = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
+      list.unshift(insertedSql as ProductReview);
+      await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, list);
+
+      return {
+        success: true,
+        duplicate: false,
+        review: insertedSql as ProductReview,
+        message:
+          lang === 'ar'
+            ? 'شكراً لتقييمك! تم إرسال مراجعتك بنجاح وستظهر على صفحة المنتج فور اعتمادها من الإدارة.'
+            : 'Thank you for your review! It has been submitted and will appear once approved by our team.'
+      };
+    }
+  }
+
+  // Tier 2: Private CRM Storage fallback if SQL table `product_reviews` is not yet created
+  const list = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
+  const dupStorage = list.find(
+    r =>
+      r.product_id === productId &&
+      r.customer_name.trim().toLowerCase() === customerName.toLowerCase() &&
+      r.rating === rawRating &&
+      String(r.review_text || '').trim() === reviewText &&
+      r.created_at >= tenMinutesAgo
+  );
+
+  if (dupStorage) {
+    return {
+      success: true,
+      duplicate: true,
+      review: dupStorage,
+      message:
+        lang === 'ar'
+          ? 'تم استلام تقييمك بالفعل وهو قيد المراجعة حالياً. شكراً لمشاركتك!'
+          : 'Your review has already been received and is pending moderation. Thank you!'
+    };
+  }
+
+  const record: ProductReview = {
+    id: generateUuid(),
+    product_id: productId,
+    customer_name: customerName,
+    rating: rawRating,
+    review_text: reviewText || null,
+    status: forcedStatus,
+    created_at: nowIso,
+    updated_at: nowIso
+  };
+
+  list.unshift(record);
+  const saved = await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, list);
+  if (!saved) {
+    return {
+      success: false,
+      message:
+        lang === 'ar'
+          ? 'تعذّر حفظ التقييم حالياً. يرجى المحاولة مرة أخرى.'
+          : 'Failed to save your review. Please try again.'
+    };
+  }
+
+  return {
+    success: true,
+    duplicate: false,
+    review: record,
+    message:
+      lang === 'ar'
+        ? 'شكراً لتقييمك! تم إرسال مراجعتك بنجاح وستظهر على صفحة المنتج فور اعتمادها من الإدارة.'
+        : 'Thank you for your review! It has been submitted and will appear once approved by our team.'
+  };
+}
+
+/**
+ * Public read: returns ONLY approved reviews (`status === 'approved'`) for a product (or all products if productId omitted).
+ * Pending and rejected reviews are strictly excluded.
+ */
+export async function listApprovedProductReviews(productId?: string): Promise<ProductReview[]> {
+  if (productId && !UUID_REGEX.test(productId.trim())) {
+    return [];
+  }
+
+  // Try public/system Supabase SQL query first
+  const client = supabase || (await getSystemAdminSupabase());
+  if (client) {
+    let query = client
+      .from('product_reviews')
+      .select('*')
+      .eq('status', 'approved')
+      .order('created_at', { ascending: false });
+
+    if (productId) {
+      query = query.eq('product_id', productId.trim());
+    }
+
+    const { data, error } = await query;
+    if (!error && Array.isArray(data)) {
+      return (data as ProductReview[]).filter(
+        r =>
+          r.status === 'approved' &&
+          typeof r.rating === 'number' &&
+          r.rating >= 1 &&
+          r.rating <= 5 &&
+          (!productId || r.product_id === productId.trim())
+      );
+    }
+  }
+
+  // Fallback to Private Storage filtered strictly to status === 'approved'
+  const adminSb = await getSystemAdminSupabase();
+  if (!adminSb) return [];
+
+  const allReviews = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
+  return allReviews
+    .filter(
+      r =>
+        r &&
+        r.status === 'approved' &&
+        typeof r.rating === 'number' &&
+        r.rating >= 1 &&
+        r.rating <= 5 &&
+        (!productId || r.product_id === productId.trim())
+    )
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+}
+
+export async function getProductReviewsAndSummary(productId: string): Promise<{
+  reviews: ProductReview[];
+  summary: ProductRatingSummary;
+}> {
+  const approvedReviews = await listApprovedProductReviews(productId);
+  const summary = computeProductRatingSummary(productId, approvedReviews);
+  return {
+    reviews: approvedReviews,
+    summary
+  };
+}
+
+/**
+ * Admin read: returns all reviews (pending, approved, rejected), optionally filtered by status or productId.
+ * Enforces admin authorization when requireAuthCheck is true.
+ */
+export async function listAdminProductReviews(options?: {
+  status?: ProductReviewStatus | 'all';
+  productId?: string;
+  token?: string;
+  isServerAuthorized?: boolean;
+  requireAuthCheck?: boolean;
+}): Promise<{
+  success: boolean;
+  unauthorized?: boolean;
+  reviews: ProductReview[];
+  message?: string;
+}> {
+  if (options?.requireAuthCheck) {
+    const authorized = await verifyAdminCallerAuthorization(options);
+    if (!authorized) {
+      return {
+        success: false,
+        unauthorized: true,
+        reviews: [],
+        message: 'غير مصرح لك بعرض تقييمات الإدارة (Admin Only).'
+      };
+    }
+  }
+
+  const adminSb = await getSystemAdminSupabase();
+  if (!adminSb) {
+    return { success: false, reviews: [], message: 'تعذر الاتصال بقاعدة البيانات.' };
+  }
+
+  let reviewsList: ProductReview[] = [];
+
+  const { data, error } = await adminSb
+    .from('product_reviews')
+    .select('*')
+    .order('created_at', { ascending: false });
+
+  if (!error && Array.isArray(data)) {
+    reviewsList = data as ProductReview[];
+  } else {
+    reviewsList = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
+  }
+
+  const statusFilter = options?.status && options.status !== 'all' ? options.status : null;
+  const productFilter = options?.productId?.trim() || null;
+
+  const filtered = reviewsList
+    .filter(r => {
+      if (!r || !r.id) return false;
+      if (statusFilter && r.status !== statusFilter) return false;
+      if (productFilter && r.product_id !== productFilter) return false;
+      return true;
+    })
+    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
+
+  return {
+    success: true,
+    reviews: filtered
+  };
+}
+
+/**
+ * Admin moderation: approves or rejects a review.
+ * Enforces admin authorization when requireAuthCheck is true.
+ */
+export async function moderateProductReview(
+  id: string,
+  status: ProductReviewStatus,
+  options?: {
+    token?: string;
+    isServerAuthorized?: boolean;
+    requireAuthCheck?: boolean;
+  }
+): Promise<{
+  success: boolean;
+  unauthorized?: boolean;
+  review?: ProductReview;
+  message?: string;
+}> {
+  if (options?.requireAuthCheck) {
+    const authorized = await verifyAdminCallerAuthorization(options);
+    if (!authorized) {
+      return {
+        success: false,
+        unauthorized: true,
+        message: 'غير مصرح لك بتعديل حالة التقييم (Admin Only).'
+      };
+    }
+  }
+
+  const validStatuses: ProductReviewStatus[] = ['pending', 'approved', 'rejected'];
+  if (!validStatuses.includes(status)) {
+    return {
+      success: false,
+      message: 'حالة التقييم غير صالحة.'
+    };
+  }
+
+  const reviewId = String(id || '').trim();
+  if (!reviewId) {
+    return {
+      success: false,
+      message: 'معرّف التقييم مطلوب.'
+    };
+  }
+
+  const adminSb = await getSystemAdminSupabase();
+  if (!adminSb) {
+    return { success: false, message: 'تعذر الاتصال بقاعدة البيانات.' };
+  }
+
+  const nowIso = new Date().toISOString();
+  let updatedRecord: ProductReview | undefined;
+
+  // Try updating SQL table if present
+  const { data: sqlData, error: sqlErr } = await adminSb
+    .from('product_reviews')
+    .update({ status, updated_at: nowIso })
+    .eq('id', reviewId)
+    .select('*')
+    .single();
+
+  if (!sqlErr && sqlData) {
+    updatedRecord = sqlData as ProductReview;
+  }
+
+  // Also update storage fallback list
+  const list = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
+  const idx = list.findIndex(r => r.id === reviewId);
+  if (idx !== -1) {
+    list[idx] = {
+      ...list[idx],
+      status,
+      updated_at: nowIso
+    };
+    await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, list);
+    if (!updatedRecord) {
+      updatedRecord = list[idx];
+    }
+  }
+
+  if (!updatedRecord) {
+    return {
+      success: false,
+      message: 'التقييم غير موجود.'
+    };
+  }
+
+  return {
+    success: true,
+    review: updatedRecord
+  };
+}
+
+/**
+ * Admin delete: permanently removes a review by ID.
+ * Enforces admin authorization when requireAuthCheck is true.
+ */
+export async function deleteProductReview(
+  id: string,
+  options?: {
+    token?: string;
+    isServerAuthorized?: boolean;
+    requireAuthCheck?: boolean;
+  }
+): Promise<{
+  success: boolean;
+  unauthorized?: boolean;
+  message?: string;
+}> {
+  if (options?.requireAuthCheck) {
+    const authorized = await verifyAdminCallerAuthorization(options);
+    if (!authorized) {
+      return {
+        success: false,
+        unauthorized: true,
+        message: 'غير مصرح لك بحذف التقييمات (Admin Only).'
+      };
+    }
+  }
+
+  const reviewId = String(id || '').trim();
+  if (!reviewId) {
+    return {
+      success: false,
+      message: 'معرّف التقييم مطلوب.'
+    };
+  }
+
+  const adminSb = await getSystemAdminSupabase();
+  if (!adminSb) {
+    return { success: false, message: 'تعذر الاتصال بقاعدة البيانات.' };
+  }
+
+  let deletedInSql = false;
+  try {
+    const { data: deletedRows, error: sqlErr } = await adminSb
+      .from('product_reviews')
+      .delete()
+      .eq('id', reviewId)
+      .select('id');
+    if (!sqlErr && Array.isArray(deletedRows) && deletedRows.length > 0) {
+      deletedInSql = true;
+    }
+  } catch {
+    // ignore if SQL table not yet migrated
+  }
+
+  const list = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
+  const initialLen = list.length;
+  const filtered = list.filter(r => r.id !== reviewId);
+  const deletedInStorage = filtered.length < initialLen;
+  if (deletedInStorage) {
+    await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, filtered);
+  }
+
+  if (!deletedInSql && !deletedInStorage) {
+    return {
+      success: false,
+      message: 'التقييم غير موجود.'
+    };
+  }
+
+  return {
+    success: true,
+    message: 'تم حذف التقييم بنجاح.'
+  };
+}
+
 

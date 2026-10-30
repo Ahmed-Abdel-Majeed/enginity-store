@@ -206,3 +206,297 @@ export function normalizePhoneNumber(phone: string): string {
   }
   return cleaned;
 }
+
+/**
+ * Calculates the integer discount percentage from originalPrice and salePrice.
+ * Formula: Math.round(((originalPrice - salePrice) / originalPrice) * 100)
+ * Returns 0 if inputs are missing, non-numeric, <= 0, or if salePrice >= originalPrice.
+ */
+export function calculateDiscountPercentage(
+  originalPrice?: number | null,
+  salePrice?: number | null
+): number {
+  if (
+    originalPrice === null ||
+    originalPrice === undefined ||
+    salePrice === null ||
+    salePrice === undefined ||
+    typeof originalPrice !== 'number' ||
+    typeof salePrice !== 'number' ||
+    !Number.isFinite(originalPrice) ||
+    !Number.isFinite(salePrice)
+  ) {
+    return 0;
+  }
+
+  if (originalPrice <= 0 || salePrice < 0 || salePrice >= originalPrice) {
+    return 0;
+  }
+
+  return Math.round(((originalPrice - salePrice) / originalPrice) * 100);
+}
+
+/**
+ * Validates and normalizes product pricing fields for Admin create/update and API payloads.
+ * Ensures:
+ * - No negative prices
+ * - Sale price strictly less than original price when discount is active
+ * - Authoritative price_egp always equals the final payable price
+ */
+export function validateProductPricing(input: {
+  originalPriceEgp?: number | null;
+  salePriceEgp?: number | null;
+  discountEnabled?: boolean;
+  hasDiscount?: boolean;
+  priceEgp?: number | null;
+}): {
+  valid: boolean;
+  errorAr?: string;
+  errorEn?: string;
+  normalized: {
+    price_egp: number;
+    original_price_egp: number;
+    sale_price_egp: number | null;
+    discountPercentage: number;
+  };
+} {
+  const rawOriginal =
+    input.originalPriceEgp !== undefined && input.originalPriceEgp !== null
+      ? Number(input.originalPriceEgp)
+      : input.priceEgp !== undefined && input.priceEgp !== null
+      ? Number(input.priceEgp)
+      : NaN;
+
+  if (!Number.isFinite(rawOriginal) || rawOriginal < 0) {
+    return {
+      valid: false,
+      errorAr: 'يرجى إدخال سعر أصلي صحيح (0 أو أكثر). لا يُسمح بالقيم السالبة.',
+      errorEn: 'Please enter a valid original price (0 or greater). Negative values are not allowed.',
+      normalized: {
+        price_egp: 0,
+        original_price_egp: 0,
+        sale_price_egp: null,
+        discountPercentage: 0
+      }
+    };
+  }
+
+  const normalizedOriginal = Number(rawOriginal.toFixed(2));
+  const explicitDiscountToggle =
+    input.discountEnabled !== undefined
+      ? input.discountEnabled
+      : input.hasDiscount;
+  const hasSaleInput =
+    explicitDiscountToggle !== undefined
+      ? Boolean(explicitDiscountToggle)
+      : input.salePriceEgp !== undefined && input.salePriceEgp !== null;
+
+  if (!hasSaleInput) {
+    return {
+      valid: true,
+      normalized: {
+        price_egp: normalizedOriginal,
+        original_price_egp: normalizedOriginal,
+        sale_price_egp: null,
+        discountPercentage: 0
+      }
+    };
+  }
+
+  const rawSale =
+    input.salePriceEgp !== undefined && input.salePriceEgp !== null
+      ? Number(input.salePriceEgp)
+      : NaN;
+
+  if (!Number.isFinite(rawSale) || rawSale <= 0) {
+    return {
+      valid: false,
+      errorAr: 'يرجى إدخال سعر بعد الخصم صحيح (أكبر من 0). لا يُسمح بالقيم السالبة أو الصفرية.',
+      errorEn: 'Please enter a valid sale price (greater than 0). Negative or zero values are not allowed.',
+      normalized: {
+        price_egp: normalizedOriginal,
+        original_price_egp: normalizedOriginal,
+        sale_price_egp: null,
+        discountPercentage: 0
+      }
+    };
+  }
+
+  if (normalizedOriginal <= 0) {
+    return {
+      valid: false,
+      errorAr: 'لا يمكن تفعيل خصم عندما يكون السعر قبل الخصم يساوي 0.',
+      errorEn: 'Cannot enable a discount when the original price is 0.',
+      normalized: {
+        price_egp: normalizedOriginal,
+        original_price_egp: normalizedOriginal,
+        sale_price_egp: null,
+        discountPercentage: 0
+      }
+    };
+  }
+
+  const normalizedSale = Number(rawSale.toFixed(2));
+
+  if (normalizedSale >= normalizedOriginal) {
+    return {
+      valid: false,
+      errorAr: 'السعر بعد الخصم يجب أن يكون أقل من السعر قبل الخصم.',
+      errorEn: 'Sale price must be strictly less than the original price.',
+      normalized: {
+        price_egp: normalizedOriginal,
+        original_price_egp: normalizedOriginal,
+        sale_price_egp: null,
+        discountPercentage: 0
+      }
+    };
+  }
+
+  const discountPercentage = calculateDiscountPercentage(normalizedOriginal, normalizedSale);
+
+  return {
+    valid: true,
+    normalized: {
+      price_egp: normalizedSale,
+      original_price_egp: normalizedOriginal,
+      sale_price_egp: normalizedSale,
+      discountPercentage
+    }
+  };
+}
+
+/**
+ * Resolves the authoritative display & checkout pricing for a product.
+ * Backward-compatible with existing products that only have price_egp.
+ */
+export function resolveProductPricing(product: {
+  price_egp?: number | null;
+  original_price_egp?: number | null;
+  sale_price_egp?: number | null;
+}): {
+  hasDiscount: boolean;
+  originalPriceEgp: number;
+  salePriceEgp: number | null;
+  effectivePriceEgp: number;
+  currentPriceEgp: number;
+  discountPercentage: number;
+} {
+  const basePrice =
+    typeof product.price_egp === 'number' && Number.isFinite(product.price_egp) && product.price_egp >= 0
+      ? Number(product.price_egp)
+      : 0;
+
+  const candidateOriginal =
+    typeof product.original_price_egp === 'number' &&
+    Number.isFinite(product.original_price_egp) &&
+    product.original_price_egp >= 0
+      ? Number(product.original_price_egp)
+      : basePrice;
+
+  const candidateSale =
+    typeof product.sale_price_egp === 'number' &&
+    Number.isFinite(product.sale_price_egp) &&
+    product.sale_price_egp >= 0
+      ? Number(product.sale_price_egp)
+      : null;
+
+  if (
+    candidateSale !== null &&
+    candidateOriginal > 0 &&
+    candidateSale < candidateOriginal
+  ) {
+    const discountPercentage = calculateDiscountPercentage(candidateOriginal, candidateSale);
+    if (discountPercentage > 0) {
+      return {
+        hasDiscount: true,
+        originalPriceEgp: candidateOriginal,
+        salePriceEgp: candidateSale,
+        effectivePriceEgp: candidateSale,
+        currentPriceEgp: candidateSale,
+        discountPercentage
+      };
+    }
+  }
+
+  const regularPrice =
+    candidateSale === null &&
+    typeof product.original_price_egp === 'number' &&
+    Number.isFinite(product.original_price_egp) &&
+    product.original_price_egp >= 0 &&
+    basePrice === 0
+      ? candidateOriginal
+      : basePrice;
+
+  return {
+    hasDiscount: false,
+    originalPriceEgp: regularPrice,
+    salePriceEgp: null,
+    effectivePriceEgp: regularPrice,
+    currentPriceEgp: regularPrice,
+    discountPercentage: 0
+  };
+}
+
+/**
+ * Computes the rating summary for a product from a list of reviews.
+ * Only approved reviews with valid ratings (1..5) are counted.
+ * Never fabricates ratings or defaults to 5 stars when there are 0 reviews.
+ */
+export function computeProductRatingSummary(
+  productId: string,
+  reviews: Array<{
+    product_id: string;
+    rating: number;
+    status: string;
+  }>
+): {
+  productId: string;
+  averageRating: number;
+  totalReviews: number;
+  distribution: { 1: number; 2: number; 3: number; 4: number; 5: number };
+} {
+  const distribution: { 1: number; 2: number; 3: number; 4: number; 5: number } = {
+    1: 0,
+    2: 0,
+    3: 0,
+    4: 0,
+    5: 0
+  };
+
+  const approved = (reviews || []).filter(
+    r =>
+      r &&
+      r.product_id === productId &&
+      r.status === 'approved' &&
+      typeof r.rating === 'number' &&
+      Number.isInteger(r.rating) &&
+      r.rating >= 1 &&
+      r.rating <= 5
+  );
+
+  if (approved.length === 0) {
+    return {
+      productId,
+      averageRating: 0,
+      totalReviews: 0,
+      distribution
+    };
+  }
+
+  let sum = 0;
+  for (const rev of approved) {
+    const star = rev.rating as 1 | 2 | 3 | 4 | 5;
+    distribution[star] = (distribution[star] || 0) + 1;
+    sum += star;
+  }
+
+  const averageRating = Number((sum / approved.length).toFixed(1));
+
+  return {
+    productId,
+    averageRating,
+    totalReviews: approved.length,
+    distribution
+  };
+}
+

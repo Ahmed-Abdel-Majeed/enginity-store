@@ -1,7 +1,7 @@
 import React, { useState } from 'react';
 import { Category, Product, WaitlistEntry } from '../../types';
 import { Plus, Search, Eye, Edit3, Trash2, ArrowUp, ArrowDown, Rocket, Users, Mail, Phone, CheckCircle2, AlertCircle, X, RefreshCw } from 'lucide-react';
-import { formatEGPPrice } from '../../lib/utils';
+import { formatEGPPrice, resolveProductPricing } from '../../lib/utils';
 import { fetchAdminWaitlist, publishAndLaunchNotifications } from '../../lib/data-store';
 
 interface ProductsListProps {
@@ -233,8 +233,29 @@ export const ProductsList: React.FC<ProductsListProps> = ({
                   </td>
 
                   {/* Price EGP */}
-                  <td className="p-3.5 font-bold font-mono text-emerald-400">
-                    {formatEGPPrice(p.price_egp)} ج.م
+                  <td className="p-3.5 font-mono">
+                    {(() => {
+                      const pr = resolveProductPricing(p);
+                      return pr.hasDiscount ? (
+                        <div className="space-y-0.5">
+                          <div className="flex items-center gap-1.5">
+                            <span className="font-bold text-emerald-400">
+                              {formatEGPPrice(pr.currentPriceEgp)} ج.م
+                            </span>
+                            <span className="px-1.5 py-0.5 rounded bg-emerald-950 text-emerald-300 border border-emerald-800 text-[10px] font-bold font-cairo">
+                              خصم {pr.discountPercentage}%
+                            </span>
+                          </div>
+                          <div className="text-[10px] text-slate-500 line-through">
+                            {formatEGPPrice(pr.originalPriceEgp)} ج.م
+                          </div>
+                        </div>
+                      ) : (
+                        <span className="font-bold text-emerald-400">
+                          {formatEGPPrice(pr.currentPriceEgp)} ج.م
+                        </span>
+                      );
+                    })()}
                   </td>
 
                   {/* Status Toggle & Badges */}

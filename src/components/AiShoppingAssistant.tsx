@@ -242,8 +242,20 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
               </span>
             ))}
           </div>
-          <div className="text-xs font-bold text-teal-400 tabular-nums shrink-0">
-            {rec.price_egp} {isAr ? 'ج.م' : 'EGP'}
+          <div className="flex flex-col items-end shrink-0">
+            {rec.discount_percentage && rec.discount_percentage > 0 && rec.original_price_egp ? (
+              <div className="flex items-center gap-1.5">
+                <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold">
+                  {isAr ? `خصم ${rec.discount_percentage}%` : `${rec.discount_percentage}% OFF`}
+                </span>
+                <span className="text-[10px] text-slate-500 line-through tabular-nums">
+                  {rec.original_price_egp} {isAr ? 'ج.م' : 'EGP'}
+                </span>
+              </div>
+            ) : null}
+            <div className="text-xs font-bold text-teal-400 tabular-nums">
+              {rec.price_egp} {isAr ? 'ج.م' : 'EGP'}
+            </div>
           </div>
         </div>
 

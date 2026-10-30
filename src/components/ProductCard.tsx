@@ -1,8 +1,8 @@
 import React from 'react';
-import { Currency, Lang, Product } from '../types';
+import { Currency, Lang, Product, ProductRatingSummary } from '../types';
 import { Translations } from '../i18n/ar';
-import { formatEGPPrice, formatUSDPrice } from '../lib/utils';
-import { ArrowLeft, ArrowRight, CheckCircle2, Zap, Sparkles, Bell, Calendar } from 'lucide-react';
+import { formatEGPPrice, formatUSDPrice, resolveProductPricing } from '../lib/utils';
+import { ArrowLeft, ArrowRight, CheckCircle2, Sparkles, Bell, Calendar, Star, Tag } from 'lucide-react';
 
 interface ProductCardProps {
   product: Product;
@@ -12,6 +12,7 @@ interface ProductCardProps {
   t: Translations;
   categoryName?: string;
   isSpotlight?: boolean;
+  ratingSummary?: ProductRatingSummary;
   onOpenWaitlist?: (product: Product) => void;
 }
 
@@ -23,12 +24,15 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
   t,
   categoryName,
   isSpotlight = false,
+  ratingSummary,
   onOpenWaitlist
 }) => {
   const isRtl = lang === 'ar';
   const isComingSoon = product.status === 'coming_soon';
   const name = isRtl ? product.name_ar : product.name_en;
   const shortDesc = isRtl ? product.short_ar : product.short_en;
+  const pricing = resolveProductPricing(product);
+  const hasVerifiedRating = Boolean(ratingSummary && ratingSummary.totalReviews > 0);
   
   const levelText =
     product.level === 'beginner'
@@ -107,6 +111,13 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
                 </span>
               )}
 
+              {pricing.hasDiscount && (
+                <span className="px-3 py-1 rounded-full bg-emerald-500 text-slate-950 font-black text-xs shadow-md flex items-center gap-1">
+                  <Tag className="w-3.5 h-3.5" />
+                  <span>{isRtl ? `خصم ${pricing.discountPercentage}%` : `${pricing.discountPercentage}% OFF`}</span>
+                </span>
+              )}
+
               {categoryName && (
                 <span className="px-3 py-1 rounded-full bg-slate-900/80 text-white font-semibold text-xs backdrop-blur-md">
                   {categoryName}
@@ -123,13 +134,23 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
           <div className="lg:col-span-5 p-6 lg:p-8 flex flex-col justify-between space-y-6">
             <div className="space-y-4">
               
-              <div className="text-xs font-bold text-[#2F6BFF] uppercase tracking-wider flex items-center gap-2">
-                <span>{isComingSoon ? (isRtl ? 'منتج قادم قريباً' : 'Upcoming System') : (isRtl ? 'نظام أتمتة جاهز للاستيراد' : 'Ready Automation System')}</span>
-                {isComingSoon && product.expected_launch_date && (
-                  <span className="text-slate-500 font-mono text-[11px] font-normal flex items-center gap-1">
-                    <Calendar className="w-3 h-3 text-amber-500" />
-                    <span>{product.expected_launch_date}</span>
-                  </span>
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="text-xs font-bold text-[#2F6BFF] uppercase tracking-wider flex items-center gap-2">
+                  <span>{isComingSoon ? (isRtl ? 'منتج قادم قريباً' : 'Upcoming System') : (isRtl ? 'نظام أتمتة جاهز للاستيراد' : 'Ready Automation System')}</span>
+                  {isComingSoon && product.expected_launch_date && (
+                    <span className="text-slate-500 font-mono text-[11px] font-normal flex items-center gap-1">
+                      <Calendar className="w-3 h-3 text-amber-500" />
+                      <span>{product.expected_launch_date}</span>
+                    </span>
+                  )}
+                </div>
+
+                {hasVerifiedRating && ratingSummary && (
+                  <div className="inline-flex items-center gap-1 px-2.5 py-0.5 rounded-lg bg-amber-50 border border-amber-200/80 text-slate-800 text-xs font-bold">
+                    <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-500" />
+                    <span>{ratingSummary.averageRating.toFixed(1)}</span>
+                    <span className="text-slate-400 text-[11px]">({ratingSummary.totalReviews})</span>
+                  </div>
                 )}
               </div>
 
@@ -162,19 +183,35 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
 
             {/* Price & Primary Action Box */}
             <div className="pt-4 border-t border-slate-100 flex flex-col sm:flex-row items-stretch sm:items-center justify-between gap-4">
-              <div>
-                <div className="text-xs text-slate-500 font-semibold">{t.priceOnce}</div>
+              <div className="space-y-0.5">
+                <div className="flex items-center gap-2">
+                  <span className="text-xs text-slate-500 font-semibold">{t.priceOnce}</span>
+                  {pricing.hasDiscount && (
+                    <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-extrabold">
+                      {isRtl ? `خصم ${pricing.discountPercentage}%` : `${pricing.discountPercentage}% OFF`}
+                    </span>
+                  )}
+                </div>
+
+                {pricing.hasDiscount && (
+                  <div className="text-xs text-slate-400 line-through font-mono-code">
+                    {currency === 'EGP'
+                      ? `${formatEGPPrice(pricing.originalPriceEgp)} ${t.egpUnit}`
+                      : `${formatUSDPrice(pricing.originalPriceEgp, usdRate)} (${formatEGPPrice(pricing.originalPriceEgp)} ${t.egpUnit})`}
+                  </div>
+                )}
+
                 <div className="font-heading font-extrabold text-2xl text-slate-900 flex items-baseline gap-1">
                   {currency === 'EGP' ? (
                     <>
-                      <span className="text-[#2F6BFF] font-mono-code">{formatEGPPrice(product.price_egp)}</span>
+                      <span className="text-[#2F6BFF] font-mono-code">{formatEGPPrice(pricing.effectivePriceEgp)}</span>
                       <span className="text-sm text-slate-600 font-normal">{t.egpUnit}</span>
                     </>
                   ) : (
                     <>
-                      <span className="text-[#2F6BFF] font-mono-code">{formatUSDPrice(product.price_egp, usdRate)}</span>
+                      <span className="text-[#2F6BFF] font-mono-code">{formatUSDPrice(pricing.effectivePriceEgp, usdRate)}</span>
                       <span className="text-xs text-slate-500 font-normal ms-1">
-                        ({formatEGPPrice(product.price_egp)} {t.egpUnit})
+                        ({formatEGPPrice(pricing.effectivePriceEgp)} {t.egpUnit})
                       </span>
                     </>
                   )}
@@ -249,18 +286,27 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
           {/* Overlays */}
           <div className="absolute inset-x-0 top-0 h-14 bg-gradient-to-b from-slate-950/60 to-transparent pointer-events-none" />
 
-          {isComingSoon ? (
-            <div className="absolute top-2.5 start-2.5 px-2.5 py-1 rounded-full bg-amber-500 text-slate-950 font-black text-[11px] shadow-sm flex items-center gap-1">
-              <Bell className="w-3 h-3" />
-              <span>{isRtl ? 'قريباً' : 'Coming Soon'}</span>
-            </div>
-          ) : (
-            categoryName && (
-              <div className="absolute top-2.5 start-2.5 px-2.5 py-1 rounded-full bg-[#2F6BFF]/90 text-white font-semibold text-[10px] backdrop-blur-md max-w-[130px] truncate">
-                {categoryName}
+          <div className="absolute top-2.5 start-2.5 flex flex-wrap items-center gap-1.5">
+            {isComingSoon ? (
+              <div className="px-2.5 py-1 rounded-full bg-amber-500 text-slate-950 font-black text-[11px] shadow-sm flex items-center gap-1">
+                <Bell className="w-3 h-3" />
+                <span>{isRtl ? 'قريباً' : 'Coming Soon'}</span>
               </div>
-            )
-          )}
+            ) : (
+              categoryName && (
+                <div className="px-2.5 py-1 rounded-full bg-[#2F6BFF]/90 text-white font-semibold text-[10px] backdrop-blur-md max-w-[130px] truncate">
+                  {categoryName}
+                </div>
+              )
+            )}
+
+            {pricing.hasDiscount && (
+              <div className="px-2.5 py-1 rounded-full bg-emerald-500 text-slate-950 font-black text-[10px] shadow-sm flex items-center gap-1">
+                <Tag className="w-3 h-3" />
+                <span>{isRtl ? `خصم ${pricing.discountPercentage}%` : `${pricing.discountPercentage}% OFF`}</span>
+              </div>
+            )}
+          </div>
 
           <div className="absolute top-2.5 end-2.5 px-2.5 py-1 rounded-full bg-slate-950/80 text-white font-mono text-[10px] font-semibold backdrop-blur-md border border-white/10 max-w-[110px] truncate">
             {levelText}
@@ -269,9 +315,18 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
 
         {/* Card Body Content */}
         <div className="p-4 sm:p-5 space-y-2.5">
-          <h3 className="font-heading font-extrabold text-base sm:text-lg text-slate-900 group-hover:text-[#2F6BFF] transition-colors line-clamp-2 leading-snug">
-            <bdi dir="auto">{name}</bdi>
-          </h3>
+          <div className="flex items-start justify-between gap-2">
+            <h3 className="font-heading font-extrabold text-base sm:text-lg text-slate-900 group-hover:text-[#2F6BFF] transition-colors line-clamp-2 leading-snug">
+              <bdi dir="auto">{name}</bdi>
+            </h3>
+            {hasVerifiedRating && ratingSummary && (
+              <div className="inline-flex items-center gap-1 px-2 py-0.5 rounded-lg bg-amber-50 border border-amber-200/80 text-slate-800 text-[11px] font-bold shrink-0">
+                <Star className="w-3 h-3 fill-amber-400 text-amber-500" />
+                <span>{ratingSummary.averageRating.toFixed(1)}</span>
+                <span className="text-slate-400 text-[10px]">({ratingSummary.totalReviews})</span>
+              </div>
+            )}
+          </div>
 
           <p className="text-xs text-slate-600 line-clamp-2 sm:line-clamp-3 leading-relaxed">
             <bdi dir="auto">{shortDesc}</bdi>
@@ -300,18 +355,34 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
       {/* Card Footer */}
       <div className="p-4 pt-3 border-t border-slate-100 flex items-center justify-between gap-3 bg-slate-50/60 group-hover:bg-blue-50/20 transition-colors mt-2">
         <div>
-          <div className="text-[10px] text-slate-500 font-medium">{t.priceOnce}</div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] text-slate-500 font-medium">{t.priceOnce}</span>
+            {pricing.hasDiscount && (
+              <span className="px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-extrabold">
+                {isRtl ? `خصم ${pricing.discountPercentage}%` : `${pricing.discountPercentage}% OFF`}
+              </span>
+            )}
+          </div>
+
+          {pricing.hasDiscount && (
+            <div className="text-[11px] text-slate-400 line-through font-mono-code">
+              {currency === 'EGP'
+                ? `${formatEGPPrice(pricing.originalPriceEgp)} ${t.egpUnit}`
+                : `${formatUSDPrice(pricing.originalPriceEgp, usdRate)}`}
+            </div>
+          )}
+
           <div className="font-heading font-extrabold text-base sm:text-lg text-slate-900 flex items-baseline gap-1">
             {currency === 'EGP' ? (
               <>
-                <span className="text-[#2F6BFF] font-mono-code">{formatEGPPrice(product.price_egp)}</span>
+                <span className="text-[#2F6BFF] font-mono-code">{formatEGPPrice(pricing.effectivePriceEgp)}</span>
                 <span className="text-xs text-slate-600 font-normal">{t.egpUnit}</span>
               </>
             ) : (
               <>
-                <span className="text-[#2F6BFF] font-mono-code">{formatUSDPrice(product.price_egp, usdRate)}</span>
+                <span className="text-[#2F6BFF] font-mono-code">{formatUSDPrice(pricing.effectivePriceEgp, usdRate)}</span>
                 <span className="text-[10px] text-slate-500 font-normal ms-1">
-                  ({formatEGPPrice(product.price_egp)} {t.egpUnit})
+                  ({formatEGPPrice(pricing.effectivePriceEgp)} {t.egpUnit})
                 </span>
               </>
             )}
@@ -339,3 +410,4 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
 };
 
 export const ProductCard = React.memo(ProductCardComponent);
+

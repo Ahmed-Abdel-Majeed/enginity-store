@@ -45,6 +45,8 @@ export interface Product {
   description_ar?: string | null;
   description_en?: string | null;
   price_egp: number;
+  original_price_egp?: number | null;
+  sale_price_egp?: number | null;
   xpay_url?: string | null;
   cover_path?: string | null;
   diagram_path?: string | null;
@@ -65,6 +67,41 @@ export interface Product {
   admin_notes?: string | null;
   created_at?: string;
   updated_at?: string;
+}
+
+export interface ResolvedProductPricing {
+  hasDiscount: boolean;
+  originalPriceEgp: number;
+  salePriceEgp: number | null;
+  effectivePriceEgp: number;
+  currentPriceEgp: number;
+  discountPercentage: number;
+}
+
+export type ProductReviewStatus = 'pending' | 'approved' | 'rejected';
+
+export interface ProductReview {
+  id: string;
+  product_id: string;
+  customer_name: string;
+  rating: number;
+  review_text?: string | null;
+  status: ProductReviewStatus;
+  created_at: string;
+  updated_at?: string;
+}
+
+export interface ProductRatingSummary {
+  productId: string;
+  averageRating: number;
+  totalReviews: number;
+  distribution: {
+    1: number;
+    2: number;
+    3: number;
+    4: number;
+    5: number;
+  };
 }
 
 export type WaitlistNotificationStatus = 'pending' | 'sent' | 'failed' | 'withdrawn';
@@ -238,6 +275,9 @@ export interface AssistantProductRecommendation {
   short_ar: string;
   short_en: string;
   price_egp: number;
+  original_price_egp?: number | null;
+  sale_price_egp?: number | null;
+  discount_percentage?: number;
   status: 'published' | 'coming_soon';
   waitlist_enabled: boolean;
   level: ProductLevel;

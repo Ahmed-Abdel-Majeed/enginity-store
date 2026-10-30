@@ -1,31 +1,32 @@
-import React, { useState } from 'react';
-import { Currency, Lang, Product, StoreSettings } from '../types';
+import React, { useState, useEffect, useCallback } from 'react';
+import { Currency, Lang, Product, ProductRatingSummary, ProductReview, StoreSettings } from '../types';
 import { Translations } from '../i18n/ar';
-import { validateXPayUrl, getYouTubeEmbedUrl, formatEGPPrice, formatUSDPrice } from '../lib/utils';
+import {
+  validateXPayUrl,
+  getYouTubeEmbedUrl,
+  formatEGPPrice,
+  formatUSDPrice,
+  resolveProductPricing
+} from '../lib/utils';
+import { fetchProductReviews } from '../lib/data-store';
+import { ProductReviewsSection } from './ProductReviewsSection';
 import {
   ChevronDown,
   ChevronUp,
   CheckCircle2,
   Lock,
   Zap,
-  ArrowRight,
-  ArrowLeft,
   Maximize2,
   AlertTriangle,
-  Play,
   Info,
   Layers,
-  ListOrdered,
   ZoomIn,
   ZoomOut,
   RotateCcw,
   Sparkles,
-  ImageIcon,
-  FileCheck,
-  ShieldCheck,
-  Wrench,
   Bell,
-  Calendar
+  Star,
+  Tag
 } from 'lucide-react';
 import ReactMarkdown from 'react-markdown';
 import rehypeSanitize from 'rehype-sanitize';
@@ -56,8 +57,33 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
   const [showDiagramModal, setShowDiagramModal] = useState(false);
   const [lightboxZoom, setLightboxZoom] = useState(1);
   const [coverImgError, setCoverImgError] = useState(false);
-  const [diagramImgError, setDiagramImgError] = useState(false);
+  const [reviews, setReviews] = useState<ProductReview[]>([]);
+  const [reviewSummary, setReviewSummary] = useState<ProductRatingSummary>({
+    productId: product.id,
+    averageRating: 0,
+    totalReviews: 0,
+    distribution: { 1: 0, 2: 0, 3: 0, 4: 0, 5: 0 }
+  });
+  const [reviewsLoading, setReviewsLoading] = useState(true);
 
+  const loadProductReviews = useCallback(async () => {
+    setReviewsLoading(true);
+    try {
+      const data = await fetchProductReviews(product.id);
+      setReviews(data.reviews);
+      setReviewSummary(data.summary);
+    } catch {
+      // keep default empty state
+    } finally {
+      setReviewsLoading(false);
+    }
+  }, [product.id]);
+
+  useEffect(() => {
+    loadProductReviews();
+  }, [loadProductReviews]);
+
+  const pricing = resolveProductPricing(product);
   const isCheckoutLinkValid = validateXPayUrl(product.xpay_url || '');
   const name = isRtl ? product.name_ar : product.name_en;
   const shortDesc = isRtl ? product.short_ar : product.short_en;
@@ -82,8 +108,8 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
   const coverImageUrl = product.cover_path;
   const primaryMediaUrl = (coverImageUrl && !coverImgError) ? product.cover_path : product.diagram_path;
 
-  // JSON-LD Product Schema
-  const jsonLd = {
+  // JSON-LD Product Schema (includes aggregateRating only when verified approved reviews exist)
+  const jsonLd: Record<string, any> = {
     '@context': 'https://schema.org',
     '@type': 'Product',
     name: name,
@@ -93,11 +119,24 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
     offers: {
       '@type': 'Offer',
       priceCurrency: 'EGP',
-      price: product.price_egp,
-      availability: 'https://schema.org/InStock',
+      price: pricing.effectivePriceEgp,
+      availability:
+        product.status === 'coming_soon'
+          ? 'https://schema.org/PreOrder'
+          : 'https://schema.org/InStock',
       url: `${process.env.APP_URL || ''}/${lang}/products/${product.slug}`
     }
   };
+
+  if (reviewSummary.totalReviews > 0) {
+    jsonLd.aggregateRating = {
+      '@type': 'AggregateRating',
+      ratingValue: reviewSummary.averageRating,
+      reviewCount: reviewSummary.totalReviews,
+      bestRating: 5,
+      worstRating: 1
+    };
+  }
 
   const openLightbox = () => {
     setLightboxZoom(1);
@@ -143,8 +182,47 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
             </span>
             <span className="px-3 py-1 rounded-full bg-emerald-100 text-emerald-800 font-mono text-xs font-bold flex items-center gap-1">
               <Sparkles className="w-3.5 h-3.5 text-emerald-600" />
-              <span>⏱️ 15 دقيقة إعداد</span>
+              <span>{isRtl ? '⏱️ 15 دقيقة إعداد' : '⏱️ 15m Setup'}</span>
             </span>
+
+            {pricing.hasDiscount && (
+              <span className="px-3 py-1 rounded-full bg-emerald-500 text-slate-950 font-black text-xs flex items-center gap-1 shadow-2xs">
+                <Tag className="w-3.5 h-3.5" />
+                <span>
+                  {isRtl
+                    ? `خصم ${pricing.discountPercentage}%`
+                    : `${pricing.discountPercentage}% OFF`}
+                </span>
+              </span>
+            )}
+
+            {reviewSummary.totalReviews > 0 ? (
+              <a
+                href="#product-reviews"
+                className="px-3 py-1 rounded-full bg-amber-50 hover:bg-amber-100 border border-amber-200/80 text-slate-900 text-xs font-extrabold flex items-center gap-1.5 transition-colors"
+              >
+                <Star className="w-3.5 h-3.5 fill-amber-400 text-amber-500" />
+                <span>{reviewSummary.averageRating.toFixed(1)} / 5</span>
+                <span className="text-slate-400">·</span>
+                <span className="text-slate-600">
+                  {isRtl
+                    ? `${reviewSummary.totalReviews} ${
+                        reviewSummary.totalReviews === 1 ? 'تقييم' : 'تقييمات'
+                      }`
+                    : `${reviewSummary.totalReviews} ${
+                        reviewSummary.totalReviews === 1 ? 'review' : 'reviews'
+                      }`}
+                </span>
+              </a>
+            ) : (
+              <a
+                href="#product-reviews"
+                className="px-3 py-1 rounded-full bg-slate-100 hover:bg-slate-200 text-slate-600 text-xs font-semibold flex items-center gap-1 transition-colors"
+              >
+                <Star className="w-3.5 h-3.5 text-amber-500" />
+                <span>{isRtl ? 'كن أول من يقيّم المنتج' : 'Be the first to review'}</span>
+              </a>
+            )}
           </div>
 
           <h1 className="font-heading font-black text-2xl sm:text-3xl lg:text-4xl text-slate-900 leading-snug">
@@ -228,17 +306,42 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
           {/* Sticky Commercial Purchase Sidebar */}
           <div className="lg:col-span-5 bg-white rounded-2xl border border-slate-200 p-6 shadow-md space-y-6 sticky top-24 text-start">
             
-            <div className="space-y-2 border-b border-slate-100 pb-5">
-              <div className="text-xs text-slate-500 font-semibold">{t.priceOnce}</div>
-              
+            <div className="space-y-2.5 border-b border-slate-100 pb-5">
+              <div className="flex items-center justify-between gap-2">
+                <span className="text-xs text-slate-500 font-semibold">{t.priceOnce}</span>
+                {pricing.hasDiscount && (
+                  <span className="inline-flex items-center gap-1 px-2.5 py-1 rounded-full bg-emerald-500 text-slate-950 font-black text-xs shadow-2xs">
+                    <Tag className="w-3.5 h-3.5" />
+                    <span>
+                      {isRtl
+                        ? `خصم ${pricing.discountPercentage}%`
+                        : `${pricing.discountPercentage}% OFF`}
+                    </span>
+                  </span>
+                )}
+              </div>
+
+              {pricing.hasDiscount && (
+                <div className="flex items-center gap-2 text-sm text-slate-400">
+                  <span className="line-through font-mono-code font-bold">
+                    {formatEGPPrice(pricing.originalPriceEgp)} {t.egpUnit}
+                  </span>
+                  <span className="px-2 py-0.5 rounded-md bg-emerald-50 text-emerald-700 border border-emerald-200 text-[11px] font-bold">
+                    {isRtl
+                      ? `توفير ${formatEGPPrice(pricing.originalPriceEgp - pricing.effectivePriceEgp)} ${t.egpUnit}`
+                      : `Save ${formatEGPPrice(pricing.originalPriceEgp - pricing.effectivePriceEgp)} ${t.egpUnit}`}
+                  </span>
+                </div>
+              )}
+
               <div className="flex items-baseline gap-2">
                 <span className="font-heading font-black text-3xl sm:text-4xl text-[#2F6BFF]">
-                  {formatEGPPrice(product.price_egp)} {t.egpUnit}
+                  {formatEGPPrice(pricing.effectivePriceEgp)} {t.egpUnit}
                 </span>
-                
+
                 {currency === 'USD' && (
                   <span className="font-mono text-base text-slate-500 font-semibold">
-                    ({formatUSDPrice(product.price_egp, settings.usd_rate)})
+                    ({formatUSDPrice(pricing.effectivePriceEgp, settings.usd_rate)})
                   </span>
                 )}
               </div>
@@ -540,6 +643,17 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
           </div>
         )}
 
+        {/* 8B. Customer Ratings & Reviews Section */}
+        <ProductReviewsSection
+          productId={product.id}
+          productName={name}
+          lang={lang}
+          reviews={reviews}
+          summary={reviewSummary}
+          loading={reviewsLoading}
+          onRefreshReviews={loadProductReviews}
+        />
+
         {/* 9. Related Automations Grid */}
         {relatedProducts.length > 0 && (
           <div className="space-y-6 text-start pt-6 border-t border-slate-200">
@@ -553,23 +667,42 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
             </div>
 
             <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
-              {relatedProducts.slice(0, 3).map(rel => (
-                <a
-                  key={rel.id}
-                  href={`/${lang}/products/${rel.slug}`}
-                  className="p-5 bg-white rounded-xl border border-slate-200 hover:border-[#2F6BFF] hover:shadow-md transition-all space-y-2 block"
-                >
-                  <div className="font-bold text-sm text-slate-900 line-clamp-1">
-                    <bdi dir="auto">{isRtl ? rel.name_ar : rel.name_en}</bdi>
-                  </div>
-                  <div className="text-xs text-slate-500 line-clamp-2">
-                    <bdi dir="auto">{isRtl ? rel.short_ar : rel.short_en}</bdi>
-                  </div>
-                  <div className="pt-2 font-heading font-bold text-sm text-[#2F6BFF]">
-                    {formatEGPPrice(rel.price_egp)} {t.egpUnit}
-                  </div>
-                </a>
-              ))}
+              {relatedProducts.slice(0, 3).map(rel => {
+                const relPricing = resolveProductPricing(rel);
+                return (
+                  <a
+                    key={rel.id}
+                    href={`/${lang}/products/${rel.slug}`}
+                    className="p-5 bg-white rounded-xl border border-slate-200 hover:border-[#2F6BFF] hover:shadow-md transition-all space-y-2 block"
+                  >
+                    <div className="flex items-center justify-between gap-2">
+                      <div className="font-bold text-sm text-slate-900 line-clamp-1">
+                        <bdi dir="auto">{isRtl ? rel.name_ar : rel.name_en}</bdi>
+                      </div>
+                      {relPricing.hasDiscount && (
+                        <span className="px-2 py-0.5 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-extrabold shrink-0">
+                          {isRtl
+                            ? `خصم ${relPricing.discountPercentage}%`
+                            : `${relPricing.discountPercentage}% OFF`}
+                        </span>
+                      )}
+                    </div>
+                    <div className="text-xs text-slate-500 line-clamp-2">
+                      <bdi dir="auto">{isRtl ? rel.short_ar : rel.short_en}</bdi>
+                    </div>
+                    <div className="pt-2 flex items-baseline gap-2">
+                      <span className="font-heading font-bold text-sm text-[#2F6BFF]">
+                        {formatEGPPrice(relPricing.effectivePriceEgp)} {t.egpUnit}
+                      </span>
+                      {relPricing.hasDiscount && (
+                        <span className="text-xs text-slate-400 line-through font-mono-code">
+                          {formatEGPPrice(relPricing.originalPriceEgp)} {t.egpUnit}
+                        </span>
+                      )}
+                    </div>
+                  </a>
+                );
+              })}
             </div>
           </div>
         )}
@@ -579,9 +712,21 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
       {/* Mobile Sticky Bottom Buy Bar */}
       <div className="fixed bottom-0 inset-x-0 z-40 bg-white/95 backdrop-blur-md border-t border-slate-200 p-3.5 sm:hidden shadow-2xl flex items-center justify-between gap-3 font-cairo">
         <div>
-          <div className="text-[10px] text-slate-500 font-medium">{t.priceOnce}</div>
+          <div className="flex items-center gap-1.5">
+            <span className="text-[10px] text-slate-500 font-medium">{t.priceOnce}</span>
+            {pricing.hasDiscount && (
+              <span className="px-1.5 py-0.2 rounded bg-emerald-50 text-emerald-700 border border-emerald-200 text-[10px] font-extrabold">
+                {isRtl ? `خصم ${pricing.discountPercentage}%` : `${pricing.discountPercentage}% OFF`}
+              </span>
+            )}
+          </div>
+          {pricing.hasDiscount && (
+            <div className="text-[11px] text-slate-400 line-through font-mono-code">
+              {formatEGPPrice(pricing.originalPriceEgp)} {t.egpUnit}
+            </div>
+          )}
           <div className="font-heading font-extrabold text-base text-slate-900 leading-tight">
-            {formatEGPPrice(product.price_egp)} {t.egpUnit}
+            {formatEGPPrice(pricing.effectivePriceEgp)} {t.egpUnit}
           </div>
         </div>
 

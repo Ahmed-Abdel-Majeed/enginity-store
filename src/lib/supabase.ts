@@ -57,8 +57,11 @@ export const getSupabaseAdmin = (token?: string) => {
   if (token) {
     try {
       return createClient(supabaseUrl, supabaseAnonKey, {
-        accessToken: async () => token,
-        auth: { persistSession: false },
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+          detectSessionInUrl: false
+        },
         global: {
           headers: {
             Authorization: `Bearer ${token}`
@@ -75,7 +78,38 @@ export const getSupabaseAdmin = (token?: string) => {
 
 let cachedAdminToken: { token: string; expiresAt: number } | null = null;
 
-// Async function for server-side system tasks that guarantees authenticated admin privileges
+export const getSystemAdminToken = async (): Promise<string | undefined> => {
+  if (!isSupabaseConfigured()) return undefined;
+  const now = Date.now();
+  if (cachedAdminToken && now < cachedAdminToken.expiresAt) {
+    return cachedAdminToken.token;
+  }
+  try {
+    const ephemeralClient = createClient(supabaseUrl, supabaseAnonKey, {
+      auth: {
+        persistSession: false,
+        autoRefreshToken: false,
+        detectSessionInUrl: false
+      }
+    });
+    const { data } = await ephemeralClient.auth.signInWithPassword({
+      email: process.env.ADMIN_EMAIL || 'admin@enginity.com',
+      password: process.env.ADMIN_PASSWORD || '123456'
+    });
+    if (data?.session?.access_token) {
+      cachedAdminToken = {
+        token: data.session.access_token,
+        expiresAt: now + (data.session.expires_in - 60) * 1000
+      };
+      return cachedAdminToken.token;
+    }
+  } catch {
+    // fallback
+  }
+  return undefined;
+};
+
+// Async function for server-side/system tasks that uses an isolated non-persisting client
 export const getSystemAdminSupabase = async (): Promise<SupabaseClient | null> => {
   if (!isSupabaseConfigured()) return null;
 
@@ -83,31 +117,13 @@ export const getSystemAdminSupabase = async (): Promise<SupabaseClient | null> =
     return initSupabaseClient(supabaseUrl, supabaseServiceRoleKey);
   }
 
-  const now = Date.now();
-  if (cachedAdminToken && now < cachedAdminToken.expiresAt) {
-    const client = getSupabaseAdmin(cachedAdminToken.token);
-    if (client) return client;
-  }
-
-  if (supabase) {
-    try {
-      const { data } = await supabase.auth.signInWithPassword({
-        email: process.env.ADMIN_EMAIL || 'admin@enginity.com',
-        password: process.env.ADMIN_PASSWORD || '123456'
-      });
-      if (data?.session?.access_token) {
-        cachedAdminToken = {
-          token: data.session.access_token,
-          expiresAt: now + (data.session.expires_in - 60) * 1000
-        };
-        return getSupabaseAdmin(data.session.access_token);
-      }
-    } catch {
-      // fallback
-    }
+  const token = await getSystemAdminToken();
+  if (token) {
+    return getSupabaseAdmin(token);
   }
 
   return getSupabaseAdmin();
 };
+
 
 

@@ -1,6 +1,6 @@
 import React, { useEffect, useState, lazy, Suspense } from 'react';
 import Cookies from 'js-cookie';
-import { Category, Currency, Lang, Product, StoreSettings } from './types';
+import { Category, Currency, Lang, Product, ProductRatingSummary, StoreSettings } from './types';
 import { ar } from './i18n/ar';
 import { en } from './i18n/en';
 import { Header } from './components/Header';
@@ -28,6 +28,7 @@ const AdminLogin = lazy(() => import('./components/admin/AdminLogin').then(m => 
 const ProductsList = lazy(() => import('./components/admin/ProductsList').then(m => ({ default: m.ProductsList })));
 const ProductForm = lazy(() => import('./components/admin/ProductForm').then(m => ({ default: m.ProductForm })));
 const CategoriesList = lazy(() => import('./components/admin/CategoriesList').then(m => ({ default: m.CategoriesList })));
+const ReviewsList = lazy(() => import('./components/admin/ReviewsList').then(m => ({ default: m.ReviewsList })));
 const SettingsForm = lazy(() => import('./components/admin/SettingsForm').then(m => ({ default: m.SettingsForm })));
 const CustomRequestsList = lazy(() => import('./components/admin/CustomRequestsList').then(m => ({ default: m.CustomRequestsList })));
 const ProductSuggestionsList = lazy(() => import('./components/admin/ProductSuggestionsList').then(m => ({ default: m.ProductSuggestionsList })));
@@ -37,6 +38,7 @@ import {
   fetchProducts,
   fetchProductBySlug,
   fetchSettings,
+  fetchAllApprovedRatingSummaries,
   createProduct,
   updateProduct,
   deleteProduct,
@@ -63,6 +65,7 @@ export default function App() {
   
   const [categories, setCategories] = useState<Category[]>([]);
   const [products, setProducts] = useState<Product[]>([]);
+  const [ratingSummaries, setRatingSummaries] = useState<Record<string, ProductRatingSummary>>({});
   const [settings, setSettings] = useState<StoreSettings | null>(null);
   const [selectedProduct, setSelectedProduct] = useState<Product | null>(null);
   const [activeWaitlistProduct, setActiveWaitlistProduct] = useState<Product | null>(null);
@@ -166,6 +169,12 @@ export default function App() {
       setCategories(cats);
       setProducts(prods);
       setSettings(sets);
+
+      if (prods.length > 0) {
+        fetchAllApprovedRatingSummaries()
+          .then(map => setRatingSummaries(map))
+          .catch(() => {});
+      }
 
       // Check if on Product Details page
       const detailsMatch = pathname.match(/^\/(ar|en)\/products\/([^\/]+)$/);
@@ -385,6 +394,8 @@ export default function App() {
               }}
             />
           )}
+
+          {adminTab === 'reviews' && <ReviewsList products={products} />}
 
           {adminTab === 'custom-requests' && <CustomRequestsList />}
 
@@ -631,6 +642,7 @@ export default function App() {
                 ]}
                 isSpotlight={true}
                 onOpenWaitlist={prod => setActiveWaitlistProduct(prod)}
+                ratingSummary={ratingSummaries[filteredProducts[0].id]}
               />
             </div>
           ) : (
@@ -650,6 +662,7 @@ export default function App() {
                     t={t}
                     categoryName={catName}
                     onOpenWaitlist={prod => setActiveWaitlistProduct(prod)}
+                    ratingSummary={ratingSummaries[p.id]}
                   />
                 );
               })}

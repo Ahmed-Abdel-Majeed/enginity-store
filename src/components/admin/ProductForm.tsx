@@ -1,8 +1,16 @@
 import React, { useState } from 'react';
 import Cookies from 'js-cookie';
 import { Category, Product, ProductLevel, ProductStatus, RequirementItem, StepItem, FaqItem } from '../../types';
-import { generateSlug, validateXPayUrl, isAllowedImageUrl } from '../../lib/utils';
-import { ArrowLeft, Save, Plus, Trash2, Eye, Upload, AlertCircle, Download, FileText, Copy, Check, RefreshCw, AlertTriangle } from 'lucide-react';
+import {
+  generateSlug,
+  validateXPayUrl,
+  isAllowedImageUrl,
+  calculateDiscountPercentage,
+  resolveProductPricing,
+  validateProductPricing,
+  formatEGPPrice
+} from '../../lib/utils';
+import { ArrowLeft, Save, Plus, Trash2, Eye, Upload, AlertCircle, Download, FileText, Copy, Check, RefreshCw, AlertTriangle, Tag } from 'lucide-react';
 import { z } from 'zod';
 
 interface ProductFormProps {
@@ -21,6 +29,8 @@ const jsonImportSchema = z.object({
   slug: z.string().optional(),
   category: z.string().optional(),
   price_egp: z.number().min(0, 'السعر بالجنيه (price_egp) يجب أن يكون رقماً بالموجب'),
+  original_price_egp: z.number().min(0).nullable().optional(),
+  sale_price_egp: z.number().min(0).nullable().optional(),
   status: z.string().optional(),
 
   level: z.enum(['beginner', 'intermediate', 'advanced']).optional(),
@@ -70,13 +80,29 @@ export const ProductForm: React.FC<ProductFormProps> = ({
   onSave,
   onCancel
 }) => {
+  const initialResolvedPricing = initialProduct
+    ? resolveProductPricing(initialProduct)
+    : {
+        hasDiscount: false,
+        originalPriceEgp: 1000,
+        salePriceEgp: null,
+        effectivePriceEgp: 1000,
+        discountPercentage: 0
+      };
+
   const [nameAr, setNameAr] = useState(initialProduct?.name_ar || '');
   const [nameEn, setNameEn] = useState(initialProduct?.name_en || '');
   const [slug, setSlug] = useState(initialProduct?.slug || '');
   const [isSlugCustom, setIsSlugCustom] = useState(Boolean(initialProduct?.slug));
   const [status, setStatus] = useState<ProductStatus>(initialProduct?.status || 'draft');
   const [categoryId, setCategoryId] = useState<number>(initialProduct?.category_id || categories[0]?.id || 1);
-  const [priceEgp, setPriceEgp] = useState<number>(initialProduct?.price_egp || 1000);
+  const [originalPriceEgp, setOriginalPriceEgp] = useState<string>(
+    String(initialResolvedPricing.originalPriceEgp)
+  );
+  const [discountEnabled, setDiscountEnabled] = useState<boolean>(initialResolvedPricing.hasDiscount);
+  const [salePriceEgp, setSalePriceEgp] = useState<string>(
+    initialResolvedPricing.salePriceEgp !== null ? String(initialResolvedPricing.salePriceEgp) : ''
+  );
   const [xpayUrl, setXpayUrl] = useState(initialProduct?.xpay_url || '');
   const [shortAr, setShortAr] = useState(initialProduct?.short_ar || '');
   const [shortEn, setShortEn] = useState(initialProduct?.short_en || '');
@@ -318,7 +344,19 @@ export const ProductForm: React.FC<ProductFormProps> = ({
           }
         }
 
-        if (typeof data.price_egp === 'number') setPriceEgp(data.price_egp);
+        if (typeof data.original_price_egp === 'number') {
+          setOriginalPriceEgp(String(data.original_price_egp));
+        } else if (typeof data.price_egp === 'number') {
+          setOriginalPriceEgp(String(data.price_egp));
+        }
+
+        if (typeof data.sale_price_egp === 'number') {
+          setDiscountEnabled(true);
+          setSalePriceEgp(String(data.sale_price_egp));
+        } else {
+          setDiscountEnabled(false);
+          setSalePriceEgp('');
+        }
         if (data.level) setLevel(data.level);
         if (typeof data.sort_order === 'number') setSortOrder(data.sort_order);
 
@@ -442,13 +480,20 @@ export const ProductForm: React.FC<ProductFormProps> = ({
 
   // Product Exporter
   const handleExportJson = () => {
+    const parsedOrig = Number(originalPriceEgp) || 0;
+    const parsedSale = discountEnabled && salePriceEgp.trim() !== '' ? Number(salePriceEgp) : null;
+    const effectiveExportPrice =
+      parsedSale !== null && parsedOrig > 0 && parsedSale < parsedOrig ? parsedSale : parsedOrig;
+
     const exportData = {
       _schema_version: 1,
       name_ar: nameAr,
       name_en: nameEn,
       slug: slug,
       category: categories.find(c => c.id === categoryId)?.slug || '',
-      price_egp: priceEgp,
+      price_egp: effectiveExportPrice,
+      original_price_egp: parsedOrig,
+      sale_price_egp: parsedSale,
       status: status,
       level: level,
       sort_order: sortOrder,
@@ -501,6 +546,21 @@ export const ProductForm: React.FC<ProductFormProps> = ({
       return;
     }
 
+    const parsedOriginal = originalPriceEgp.trim() === '' ? NaN : Number(originalPriceEgp);
+    const parsedSale =
+      discountEnabled && salePriceEgp.trim() !== '' ? Number(salePriceEgp) : discountEnabled ? NaN : null;
+
+    const pricingValidation = validateProductPricing({
+      originalPriceEgp: parsedOriginal,
+      salePriceEgp: parsedSale,
+      discountEnabled
+    });
+
+    if (!pricingValidation.valid) {
+      setFormError(pricingValidation.errorAr || 'بيانات التسعير والخصم غير صالحة.');
+      return;
+    }
+
     const toolsList = toolsInput
       .split(',')
       .map(t => t.trim())
@@ -515,7 +575,9 @@ export const ProductForm: React.FC<ProductFormProps> = ({
         slug: slug.trim() || generateSlug(nameEn),
         status,
         category_id: categoryId,
-        price_egp: Number(priceEgp),
+        price_egp: pricingValidation.normalized.price_egp,
+        original_price_egp: pricingValidation.normalized.original_price_egp,
+        sale_price_egp: pricingValidation.normalized.sale_price_egp,
         xpay_url: xpayUrl.trim(),
         short_ar: shortAr,
         short_en: shortEn,
@@ -730,19 +792,6 @@ export const ProductForm: React.FC<ProductFormProps> = ({
               </select>
             </div>
 
-            {/* Price EGP */}
-            <div className="space-y-1.5">
-              <label className="text-xs font-semibold text-slate-300">السعر بالجنيه المصري (Price EGP) *</label>
-              <input
-                type="number"
-                min={0}
-                required
-                value={priceEgp}
-                onChange={e => { setPriceEgp(Number(e.target.value)); markDirty(); }}
-                className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white text-xs font-mono focus:outline-hidden focus:border-blue-500"
-              />
-            </div>
-
             {/* Status Dropdown */}
             <div className="space-y-1.5">
               <label className="text-xs font-semibold text-slate-300">حالة النشر (Status)</label>
@@ -785,6 +834,176 @@ export const ProductForm: React.FC<ProductFormProps> = ({
 
           </div>
 
+          {/* Dynamic Pricing & Discount Engine Panel */}
+          <div className="p-5 bg-slate-950/90 border border-slate-800 rounded-2xl space-y-5">
+            <div className="flex flex-wrap items-center justify-between gap-3 border-b border-slate-800/80 pb-3.5">
+              <div className="flex items-center gap-2.5">
+                <div className="w-8 h-8 rounded-xl bg-emerald-500/15 border border-emerald-500/30 text-emerald-400 flex items-center justify-center">
+                  <Tag className="w-4 h-4" />
+                </div>
+                <div>
+                  <h4 className="text-xs sm:text-sm font-bold text-white">
+                    إعدادات التسعير والخصومات (Pricing & Automatic Discount)
+                  </h4>
+                  <p className="text-[11px] text-slate-400">
+                    حدد السعر قبل الخصم وفعّل الخصم لحساب نسبة الخصم تلقائياً وعرضها في المتجر
+                  </p>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-3">
+                <label className="inline-flex items-center gap-2 px-3 py-1.5 rounded-xl bg-slate-900 border border-slate-800 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={discountEnabled}
+                    onChange={e => {
+                      const checked = e.target.checked;
+                      setDiscountEnabled(checked);
+                      if (!checked) {
+                        setSalePriceEgp('');
+                      } else if (!salePriceEgp && Number(originalPriceEgp) > 0) {
+                        setSalePriceEgp(String(Math.round(Number(originalPriceEgp) * 0.75)));
+                      }
+                      markDirty();
+                    }}
+                    className="w-4 h-4 rounded accent-emerald-500"
+                  />
+                  <span className="text-xs font-bold text-slate-200">تفعيل الخصم</span>
+                </label>
+
+                {discountEnabled && (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setDiscountEnabled(false);
+                      setSalePriceEgp('');
+                      markDirty();
+                    }}
+                    className="px-3 py-1.5 rounded-xl bg-rose-500/15 hover:bg-rose-500/25 border border-rose-500/30 text-rose-300 text-xs font-bold transition-colors cursor-pointer"
+                  >
+                    إلغاء الخصم
+                  </button>
+                )}
+              </div>
+            </div>
+
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-4 items-start">
+              {/* Original Price (السعر قبل الخصم) */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-300 block">
+                  {discountEnabled
+                    ? 'السعر قبل الخصم (Original Price EGP) *'
+                    : 'السعر الأساسي بالجنيه (Price EGP) *'}
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  required
+                  value={originalPriceEgp}
+                  onChange={e => {
+                    setOriginalPriceEgp(e.target.value);
+                    markDirty();
+                  }}
+                  placeholder="1000"
+                  className="w-full px-3.5 py-2.5 bg-slate-900 border border-slate-700 rounded-xl text-white text-xs font-mono focus:outline-hidden focus:border-blue-500"
+                />
+                <span className="text-[10px] text-slate-500 block">
+                  يظهر مشطوباً (~~1,000 ج.م~~) عند تفعيل الخصم.
+                </span>
+              </div>
+
+              {/* Sale Price (السعر بعد الخصم) */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-300 block">
+                  السعر بعد الخصم (Sale Price EGP) {discountEnabled ? '*' : '(غير مفعل)'}
+                </label>
+                <input
+                  type="number"
+                  min={0}
+                  step="0.01"
+                  disabled={!discountEnabled}
+                  required={discountEnabled}
+                  value={salePriceEgp}
+                  onChange={e => {
+                    setSalePriceEgp(e.target.value);
+                    markDirty();
+                  }}
+                  placeholder={discountEnabled ? '750' : 'فعّل الخصم لإدخال سعر الخصم'}
+                  className="w-full px-3.5 py-2.5 bg-slate-900 disabled:bg-slate-900/40 disabled:text-slate-600 border border-slate-700 rounded-xl text-white text-xs font-mono focus:outline-hidden focus:border-emerald-500"
+                />
+                {discountEnabled &&
+                  salePriceEgp.trim() !== '' &&
+                  Number(salePriceEgp) >= Number(originalPriceEgp) && (
+                    <span className="text-[11px] text-rose-400 font-bold block">
+                      ⚠️ السعر بعد الخصم يجب أن يكون أقل من السعر قبل الخصم.
+                    </span>
+                  )}
+                {discountEnabled && Number(salePriceEgp) < 0 && (
+                  <span className="text-[11px] text-rose-400 font-bold block">
+                    ⚠️ لا يُسمح بإدخال سعر سالب.
+                  </span>
+                )}
+              </div>
+
+              {/* Automatically Calculated Discount Percentage & Storefront Preview */}
+              <div className="space-y-1.5">
+                <label className="text-xs font-semibold text-slate-300 block">
+                  نسبة الخصم المحسوبة تلقائياً (Discount %)
+                </label>
+                {(() => {
+                  const numOrig = Number(originalPriceEgp);
+                  const numSale = discountEnabled && salePriceEgp.trim() !== '' ? Number(salePriceEgp) : null;
+                  const pct =
+                    discountEnabled && numSale !== null
+                      ? calculateDiscountPercentage(numOrig, numSale)
+                      : 0;
+                  const isValidDiscount =
+                    discountEnabled &&
+                    numSale !== null &&
+                    Number.isFinite(numOrig) &&
+                    Number.isFinite(numSale) &&
+                    numOrig > 0 &&
+                    numSale >= 0 &&
+                    numSale < numOrig &&
+                    pct > 0;
+
+                  return (
+                    <div className="p-3 rounded-xl bg-slate-900 border border-slate-800 flex items-center justify-between gap-3">
+                      <div>
+                        <div className="text-[11px] text-slate-400">معاينة السعر النهائي:</div>
+                        {isValidDiscount ? (
+                          <div className="flex items-baseline gap-2 pt-0.5">
+                            <span className="font-mono font-extrabold text-sm text-emerald-400">
+                              {formatEGPPrice(numSale)} ج.م
+                            </span>
+                            <span className="font-mono text-xs text-slate-500 line-through">
+                              {formatEGPPrice(numOrig)} ج.م
+                            </span>
+                          </div>
+                        ) : (
+                          <div className="font-mono font-extrabold text-sm text-blue-400 pt-0.5">
+                            {Number.isFinite(numOrig) && numOrig >= 0 ? formatEGPPrice(numOrig) : '0'} ج.م
+                          </div>
+                        )}
+                      </div>
+
+                      <div
+                        className={`px-3 py-1.5 rounded-xl font-mono text-xs font-black border ${
+                          isValidDiscount
+                            ? 'bg-emerald-500/20 border-emerald-500/40 text-emerald-300'
+                            : 'bg-slate-800 border-slate-700 text-slate-400'
+                        }`}
+                      >
+                        {isValidDiscount ? `خصم ${pct}%` : 'بدون خصم (0%)'}
+                      </div>
+                    </div>
+                  );
+                })()}
+              </div>
+            </div>
+          </div>
+
           {/* Payment URL */}
           <div className="space-y-1.5">
             <label className="text-xs font-semibold text-slate-300">رابط الدفع المباشر (Payment URL)</label>
@@ -795,7 +1014,9 @@ export const ProductForm: React.FC<ProductFormProps> = ({
               placeholder="https://xpay.app/p/enginity-workflow"
               className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white text-xs font-mono focus:outline-hidden focus:border-blue-500"
             />
-            <span className="text-[11px] text-slate-500">رابط الدفع المباشر المخصص لهذا المنتج (HTTPS).</span>
+            <span className="text-[11px] text-slate-400 block">
+              رابط الدفع المباشر المخصص لهذا المنتج (HTTPS). ملاحظة هامة: تأكد أن قيمة رابط الدفع في لوحة XPay تطابق السعر النهائي المستحق بعد الخصم.
+            </span>
           </div>
 
           {/* Tools input */}

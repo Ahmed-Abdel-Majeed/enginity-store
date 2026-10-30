@@ -11,10 +11,19 @@ import {
   ProductSuggestionStatus,
   PurchaseLikelihood,
   DemandAnalyticsSummary,
-  AssistantResponsePayload
+  AssistantResponsePayload,
+  ProductReview,
+  ProductReviewStatus,
+  ProductRatingSummary
 } from '../types';
 import { supabase, isSupabaseConfigured, getSupabaseAdmin, getSystemAdminSupabase } from './supabase';
-import { normalizeDateToIso, normalizePhoneNumber } from './utils';
+import {
+  normalizeDateToIso,
+  normalizePhoneNumber,
+  resolveProductPricing,
+  validateProductPricing,
+  computeProductRatingSummary
+} from './utils';
 import {
   createCustomAutomationRequest,
   listCustomAutomationRequests,
@@ -22,10 +31,93 @@ import {
   createProductSuggestion,
   listProductSuggestions,
   updateProductSuggestion,
-  computeDemandAnalytics
+  computeDemandAnalytics,
+  createProductReview,
+  listApprovedProductReviews,
+  getProductReviewsAndSummary,
+  listAdminProductReviews,
+  moderateProductReview,
+  deleteProductReview
 } from './crm-store';
 import { processAssistantTurn } from './assistant-engine';
 import Cookies from 'js-cookie';
+
+const PRICING_META_REGEX = /\n?<!--ENGINITY_PRICING:(\{[^\n]*?\})-->\s*$/;
+
+export function stripPricingMetaFromNotes(notes?: string | null): string {
+  if (!notes || typeof notes !== 'string') return '';
+  return notes.replace(PRICING_META_REGEX, '').trimEnd();
+}
+
+export function attachPricingMetaToAdminNotes(
+  notes: string | null | undefined,
+  originalPriceEgp: number,
+  salePriceEgp: number | null
+): string {
+  const clean = stripPricingMetaFromNotes(notes);
+  const meta = JSON.stringify({
+    original_price_egp: originalPriceEgp,
+    sale_price_egp: salePriceEgp
+  });
+  return clean ? `${clean}\n<!--ENGINITY_PRICING:${meta}-->` : `<!--ENGINITY_PRICING:${meta}-->`;
+}
+
+export function hydrateProductPricing(raw: any): Product {
+  if (!raw || typeof raw !== 'object') return raw;
+
+  let extractedMeta: { original_price_egp?: number | null; sale_price_egp?: number | null } | null = null;
+  let cleanAdminNotes = raw.admin_notes;
+
+  if (typeof raw.admin_notes === 'string') {
+    const match = raw.admin_notes.match(PRICING_META_REGEX);
+    if (match && match[1]) {
+      try {
+        extractedMeta = JSON.parse(match[1]);
+      } catch {
+        extractedMeta = null;
+      }
+      cleanAdminNotes = stripPricingMetaFromNotes(raw.admin_notes);
+    }
+  }
+
+  const hasNativeOriginal =
+    raw.original_price_egp !== undefined &&
+    raw.original_price_egp !== null &&
+    Number.isFinite(Number(raw.original_price_egp));
+
+  const hasNativeSale =
+    raw.sale_price_egp !== undefined &&
+    raw.sale_price_egp !== null &&
+    Number.isFinite(Number(raw.sale_price_egp));
+
+  const candidateOriginal = hasNativeOriginal
+    ? Number(raw.original_price_egp)
+    : extractedMeta && typeof extractedMeta.original_price_egp === 'number'
+    ? extractedMeta.original_price_egp
+    : Number(raw.price_egp) || 0;
+
+  const candidateSale = hasNativeSale
+    ? Number(raw.sale_price_egp)
+    : raw.sale_price_egp === null
+    ? null
+    : extractedMeta && extractedMeta.sale_price_egp !== undefined
+    ? extractedMeta.sale_price_egp
+    : null;
+
+  const resolved = resolveProductPricing({
+    price_egp: Number(raw.price_egp) || 0,
+    original_price_egp: candidateOriginal,
+    sale_price_egp: candidateSale
+  });
+
+  return {
+    ...raw,
+    admin_notes: cleanAdminNotes,
+    price_egp: resolved.effectivePriceEgp,
+    original_price_egp: resolved.originalPriceEgp,
+    sale_price_egp: resolved.salePriceEgp
+  };
+}
 
 // In-Memory SWR Cache for categories and settings
 let cachedCategories: { data: Category[]; timestamp: number } | null = null;
@@ -143,7 +235,7 @@ export async function fetchProducts(options?: {
       return [];
     }
     if (data) {
-      let result: Product[] = data;
+      let result: Product[] = data.map(hydrateProductPricing);
       if (searchQuery) {
         result = result.filter(
           p =>
@@ -170,7 +262,7 @@ export async function fetchProductBySlug(slug: string, publishedOnly = true): Pr
       query = query.in('status', ['published', 'coming_soon']);
     }
     const { data, error } = await query.single();
-    if (!error && data) return data;
+    if (!error && data) return hydrateProductPricing(data);
   }
   return null;
 }
@@ -191,11 +283,29 @@ async function getActiveClient() {
 }
 
 export async function createProduct(productData: Partial<Product>, token?: string): Promise<Product | null> {
-  const payload = { ...productData };
+  const payload: any = { ...productData };
   if (!payload.id) delete payload.id;
   if (payload.expected_launch_date) {
     payload.expected_launch_date = normalizeDateToIso(payload.expected_launch_date);
   }
+
+  // Validate and normalize pricing fields
+  const pricingCheck = validateProductPricing({
+    originalPriceEgp: payload.original_price_egp,
+    salePriceEgp: payload.sale_price_egp,
+    priceEgp: payload.price_egp
+  });
+  if (!pricingCheck.valid) {
+    throw new Error(pricingCheck.errorAr || 'بيانات التسعير غير صالحة.');
+  }
+  payload.price_egp = pricingCheck.normalized.price_egp;
+  payload.original_price_egp = pricingCheck.normalized.original_price_egp;
+  payload.sale_price_egp = pricingCheck.normalized.sale_price_egp;
+  payload.admin_notes = attachPricingMetaToAdminNotes(
+    payload.admin_notes,
+    pricingCheck.normalized.original_price_egp,
+    pricingCheck.normalized.sale_price_egp
+  );
 
   if (typeof window !== 'undefined') {
     try {
@@ -211,7 +321,7 @@ export async function createProduct(productData: Partial<Product>, token?: strin
 
       if (res.ok) {
         const json = await res.json();
-        if (json.product) return json.product;
+        if (json.product) return hydrateProductPricing(json.product);
       } else if (res.status !== 405 && res.status !== 404 && res.status !== 502) {
         const errJson = await res.json().catch(() => ({}));
         const detailStr = errJson.details
@@ -229,11 +339,26 @@ export async function createProduct(productData: Partial<Product>, token?: strin
 
   const client = await getActiveClient();
   if (client) {
-    const { data, error } = await client
+    let { data, error } = await client
       .from('products')
       .insert(payload)
       .select()
       .single();
+
+    // Fallback if migration 0005 columns (original_price_egp / sale_price_egp) are not yet in remote schema cache
+    if (error && (error.message?.includes('original_price_egp') || error.message?.includes('sale_price_egp'))) {
+      const fallbackPayload = { ...payload };
+      delete fallbackPayload.original_price_egp;
+      delete fallbackPayload.sale_price_egp;
+      const retry = await client
+        .from('products')
+        .insert(fallbackPayload)
+        .select()
+        .single();
+      data = retry.data;
+      error = retry.error;
+    }
+
     if (error) {
       console.error('Supabase direct insert product error:', error);
       throw new Error(`خطأ في حفظ المنتج: ${error.message}`);
@@ -246,16 +371,87 @@ export async function createProduct(productData: Partial<Product>, token?: strin
           console.warn('Auto launch dispatch on create warning:', e);
         }
       }
-      return data;
+      return hydrateProductPricing(data);
     }
   }
   return null;
 }
 
 export async function updateProduct(id: string, productData: Partial<Product>, token?: string): Promise<Product | null> {
-  const payload = { ...productData };
+  const payload: any = { ...productData };
   if (payload.expected_launch_date) {
     payload.expected_launch_date = normalizeDateToIso(payload.expected_launch_date);
+  }
+
+  const client = await getActiveClient();
+
+  const touchesPricing =
+    payload.price_egp !== undefined ||
+    payload.original_price_egp !== undefined ||
+    payload.sale_price_egp !== undefined;
+
+  if (touchesPricing) {
+    let existingRawNotes: string | null | undefined = payload.admin_notes;
+    let existingOriginal: number | null | undefined = payload.original_price_egp;
+
+    if ((existingRawNotes === undefined || existingOriginal === undefined) && client) {
+      try {
+        const { data: currentRow } = await client
+          .from('products')
+          .select('price_egp, admin_notes')
+          .eq('id', id)
+          .maybeSingle();
+        if (currentRow) {
+          const hydratedCurrent = hydrateProductPricing(currentRow);
+          if (existingRawNotes === undefined) {
+            existingRawNotes = hydratedCurrent.admin_notes;
+          }
+          if (existingOriginal === undefined && payload.price_egp === undefined) {
+            existingOriginal = hydratedCurrent.original_price_egp;
+          }
+        }
+      } catch {
+        // ignore
+      }
+    }
+
+    const pricingCheck = validateProductPricing({
+      originalPriceEgp: existingOriginal !== undefined ? existingOriginal : payload.price_egp,
+      salePriceEgp: payload.sale_price_egp,
+      priceEgp: payload.price_egp
+    });
+
+    if (!pricingCheck.valid) {
+      throw new Error(pricingCheck.errorAr || 'بيانات التسعير غير صالحة.');
+    }
+
+    payload.price_egp = pricingCheck.normalized.price_egp;
+    payload.original_price_egp = pricingCheck.normalized.original_price_egp;
+    payload.sale_price_egp = pricingCheck.normalized.sale_price_egp;
+    payload.admin_notes = attachPricingMetaToAdminNotes(
+      existingRawNotes,
+      pricingCheck.normalized.original_price_egp,
+      pricingCheck.normalized.sale_price_egp
+    );
+  } else if (payload.admin_notes !== undefined && client) {
+    // Preserve any existing pricing metadata tag when updating admin_notes alone
+    try {
+      const { data: currentRow } = await client
+        .from('products')
+        .select('price_egp, admin_notes')
+        .eq('id', id)
+        .maybeSingle();
+      if (currentRow) {
+        const hydratedCurrent = hydrateProductPricing(currentRow);
+        payload.admin_notes = attachPricingMetaToAdminNotes(
+          payload.admin_notes,
+          hydratedCurrent.original_price_egp ?? hydratedCurrent.price_egp,
+          hydratedCurrent.sale_price_egp ?? null
+        );
+      }
+    } catch {
+      // ignore
+    }
   }
 
   if (typeof window !== 'undefined') {
@@ -272,7 +468,7 @@ export async function updateProduct(id: string, productData: Partial<Product>, t
 
       if (res.ok) {
         const json = await res.json();
-        if (json.product) return json.product;
+        if (json.product) return hydrateProductPricing(json.product);
       } else if (res.status !== 405 && res.status !== 404 && res.status !== 502) {
         const errJson = await res.json().catch(() => ({}));
         const detailStr = errJson.details
@@ -288,14 +484,28 @@ export async function updateProduct(id: string, productData: Partial<Product>, t
     }
   }
 
-  const client = await getActiveClient();
   if (client) {
-    const { data, error } = await client
+    let { data, error } = await client
       .from('products')
       .update({ ...payload, updated_at: new Date().toISOString() })
       .eq('id', id)
       .select()
       .single();
+
+    if (error && (error.message?.includes('original_price_egp') || error.message?.includes('sale_price_egp'))) {
+      const fallbackPayload = { ...payload };
+      delete fallbackPayload.original_price_egp;
+      delete fallbackPayload.sale_price_egp;
+      const retry = await client
+        .from('products')
+        .update({ ...fallbackPayload, updated_at: new Date().toISOString() })
+        .eq('id', id)
+        .select()
+        .single();
+      data = retry.data;
+      error = retry.error;
+    }
+
     if (error) {
       console.error('Supabase direct update product error:', error);
       throw new Error(`خطأ في تحديث المنتج: ${error.message}`);
@@ -308,7 +518,7 @@ export async function updateProduct(id: string, productData: Partial<Product>, t
           console.warn('Auto launch dispatch on update warning:', e);
         }
       }
-      return data;
+      return hydrateProductPricing(data);
     }
   }
   return null;
@@ -1181,5 +1391,185 @@ export async function sendAssistantMessage(params: {
   inFlightAssistantRequests.set(dedupeKey, task);
   return await task;
 }
+
+// ============================================================================
+// FEATURE D: PRODUCT RATINGS & CUSTOMER REVIEWS WRAPPERS
+// ============================================================================
+
+export async function submitProductReview(input: {
+  product_id: string;
+  customer_name: string;
+  rating: number;
+  review_text?: string | null;
+  lang?: Lang;
+}): Promise<{
+  success: boolean;
+  message: string;
+  review?: ProductReview;
+  duplicate?: boolean;
+}> {
+  if (typeof window !== 'undefined') {
+    try {
+      const res = await fetch('/api/reviews', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(input)
+      });
+      if (res.ok) {
+        const json = await res.json();
+        return {
+          success: true,
+          message: json.message,
+          review: json.review,
+          duplicate: json.duplicate
+        };
+      } else if (res.status !== 404 && res.status !== 405 && res.status !== 502) {
+        const json = await res.json().catch(() => ({}));
+        return {
+          success: false,
+          message:
+            json.error ||
+            (input.lang === 'en' ? 'Failed to submit review.' : 'تعذّر إرسال التقييم.')
+        };
+      }
+    } catch (err) {
+      console.warn('submitProductReview API unreachable, using direct CRM store fallback:', err);
+    }
+  }
+
+  return await createProductReview(input);
+}
+
+export async function fetchProductReviews(productId: string): Promise<{
+  reviews: ProductReview[];
+  summary: ProductRatingSummary;
+}> {
+  if (typeof window !== 'undefined') {
+    try {
+      const res = await fetch(`/api/reviews/${encodeURIComponent(productId)}`);
+      if (res.ok) {
+        const json = await res.json();
+        if (Array.isArray(json.reviews) && json.summary) {
+          return {
+            reviews: json.reviews,
+            summary: json.summary
+          };
+        }
+      }
+    } catch {
+      // Fallback to direct store
+    }
+  }
+
+  return await getProductReviewsAndSummary(productId);
+}
+
+export async function fetchAllApprovedRatingSummaries(): Promise<
+  Record<string, ProductRatingSummary>
+> {
+  const approved = await listApprovedProductReviews();
+  const byProduct = new Map<string, ProductReview[]>();
+  for (const rev of approved) {
+    if (!rev.product_id) continue;
+    const list = byProduct.get(rev.product_id) || [];
+    list.push(rev);
+    byProduct.set(rev.product_id, list);
+  }
+
+  const summaries: Record<string, ProductRatingSummary> = {};
+  for (const [productId, revs] of byProduct.entries()) {
+    summaries[productId] = computeProductRatingSummary(productId, revs);
+  }
+  return summaries;
+}
+
+export async function fetchAdminReviews(options?: {
+  status?: ProductReviewStatus | 'all';
+  productId?: string;
+}): Promise<ProductReview[]> {
+  if (typeof window !== 'undefined') {
+    try {
+      const params = new URLSearchParams();
+      if (options?.status && options.status !== 'all') params.set('status', options.status);
+      if (options?.productId) params.set('productId', options.productId);
+      const qs = params.toString() ? `?${params.toString()}` : '';
+      const res = await fetch(`/api/admin/reviews${qs}`, {
+        headers: {
+          ...getAuthHeader()
+        },
+        credentials: 'include'
+      });
+      if (res.ok) {
+        const json = await res.json();
+        return json.reviews || [];
+      }
+    } catch (err) {
+      console.warn('fetchAdminReviews API fallback:', err);
+    }
+  }
+
+  const res = await listAdminProductReviews({
+    status: options?.status,
+    productId: options?.productId
+  });
+  return res.reviews;
+}
+
+export async function updateAdminReviewStatus(
+  id: string,
+  status: ProductReviewStatus
+): Promise<{ success: boolean; review?: ProductReview; message?: string }> {
+  if (typeof window !== 'undefined') {
+    try {
+      const res = await fetch(`/api/admin/reviews/${encodeURIComponent(id)}`, {
+        method: 'PUT',
+        headers: {
+          'Content-Type': 'application/json',
+          ...getAuthHeader()
+        },
+        credentials: 'include',
+        body: JSON.stringify({ status })
+      });
+      if (res.ok) {
+        const json = await res.json();
+        return { success: true, review: json.review };
+      } else if (res.status !== 404 && res.status !== 405) {
+        const json = await res.json().catch(() => ({}));
+        return { success: false, message: json.error };
+      }
+    } catch (err) {
+      console.warn('updateAdminReviewStatus API fallback:', err);
+    }
+  }
+
+  return await moderateProductReview(id, status);
+}
+
+export async function deleteAdminReview(
+  id: string
+): Promise<{ success: boolean; message?: string }> {
+  if (typeof window !== 'undefined') {
+    try {
+      const res = await fetch(`/api/admin/reviews/${encodeURIComponent(id)}`, {
+        method: 'DELETE',
+        headers: {
+          ...getAuthHeader()
+        },
+        credentials: 'include'
+      });
+      if (res.ok) {
+        return { success: true };
+      } else if (res.status !== 404 && res.status !== 405) {
+        const json = await res.json().catch(() => ({}));
+        return { success: false, message: json.error };
+      }
+    } catch (err) {
+      console.warn('deleteAdminReview API fallback:', err);
+    }
+  }
+
+  return await deleteProductReview(id);
+}
+
 
 

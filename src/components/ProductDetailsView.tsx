@@ -9,7 +9,7 @@ import {
   formatExactEgpCharge,
   resolveProductPricing
 } from '../lib/utils';
-import { fetchProductReviews, createCheckoutOrder } from '../lib/data-store';
+import { fetchProductReviews } from '../lib/data-store';
 import { useModalA11y } from '../lib/use-modal-a11y';
 import { ProductReviewsSection } from './ProductReviewsSection';
 import {
@@ -57,13 +57,6 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
   const isRtl = lang === 'ar';
   const [openFaqIdx, setOpenFaqIdx] = useState<number | null>(0);
   const [showDiagramModal, setShowDiagramModal] = useState(false);
-  const [showCheckoutModal, setShowCheckoutModal] = useState(false);
-  const [customerName, setCustomerName] = useState('');
-  const [customerEmail, setCustomerEmail] = useState('');
-  const [customerPhone, setCustomerPhone] = useState('');
-  const [websiteUrl, setWebsiteUrl] = useState('');
-  const [checkoutLoading, setCheckoutLoading] = useState(false);
-  const [checkoutError, setCheckoutError] = useState<string | null>(null);
   const [lightboxZoom, setLightboxZoom] = useState(1);
   const [coverImgError, setCoverImgError] = useState(false);
   const [reviews, setReviews] = useState<ProductReview[]>([]);
@@ -77,9 +70,6 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
 
   const diagramModalRef = useModalA11y<HTMLDivElement>(showDiagramModal, () =>
     setShowDiagramModal(false)
-  );
-  const checkoutModalRef = useModalA11y<HTMLDivElement>(showCheckoutModal, () =>
-    setShowCheckoutModal(false)
   );
 
   const loadProductReviews = useCallback(async () => {
@@ -395,17 +385,14 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
                   </div>
                 )
               ) : isCheckoutLinkValid ? (
-                <button
-                  type="button"
-                  onClick={() => {
-                    setCheckoutError(null);
-                    setShowCheckoutModal(true);
-                  }}
+                <a
+                  href={product.xpay_url}
+                  rel="noopener noreferrer"
                   className="w-full py-4 bg-[#2F6BFF] hover:bg-[#1a56e8] text-white rounded-xl font-extrabold text-base transition-all flex items-center justify-center gap-2 shadow-md hover:shadow-lg active:scale-[0.99] cursor-pointer"
                 >
                   <span>{t.buyNow}</span>
                   <Zap className="w-5 h-5 text-amber-300 fill-amber-300" />
-                </button>
+                </a>
               ) : (
                 <button
                   disabled
@@ -764,205 +751,18 @@ export const ProductDetailsView: React.FC<ProductDetailsViewProps> = ({
             <span className="text-xs text-slate-400 font-medium px-3 py-2 bg-slate-100 rounded-lg">قريباً</span>
           )
         ) : isCheckoutLinkValid ? (
-          <button
-            type="button"
-            onClick={() => {
-              setCheckoutError(null);
-              setShowCheckoutModal(true);
-            }}
+          <a
+            href={product.xpay_url}
+            rel="noopener noreferrer"
             className="px-5 py-2.5 min-h-[44px] bg-[#2F6BFF] hover:bg-[#1a56e8] active:bg-[#1546c2] text-white rounded-xl font-bold text-xs shadow-md transition-colors flex items-center justify-center gap-1.5 cursor-pointer"
           >
             <span>{t.buyNow}</span>
             <Zap className="w-4 h-4 text-amber-300 fill-amber-300" />
-          </button>
+          </a>
         ) : (
           <span className="text-xs text-slate-400 font-medium px-3 py-2 bg-slate-100 rounded-lg">غير متاح</span>
         )}
       </div>
-
-      {/* Checkout Order Creation & Settlement Disclosure Modal (TASK-003, TASK-010, TASK-012) */}
-      {showCheckoutModal && (
-        <div
-          className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 font-cairo"
-          onClick={() => setShowCheckoutModal(false)}
-        >
-          <div
-            ref={checkoutModalRef}
-            role="dialog"
-            aria-modal="true"
-            aria-labelledby="checkout-modal-title"
-            className="bg-white rounded-3xl max-w-lg w-full max-h-[90dvh] overflow-y-auto p-6 sm:p-8 space-y-5 shadow-2xl border border-slate-200 text-start"
-            onClick={e => e.stopPropagation()}
-          >
-            <div className="flex items-start justify-between gap-3 border-b border-slate-100 pb-4">
-              <div>
-                <h3 id="checkout-modal-title" className="font-heading font-extrabold text-lg sm:text-xl text-slate-900">
-                  {isRtl ? 'تأكيد بيانات الطلب والدفع الآمن' : 'Confirm Order & Secure Checkout'}
-                </h3>
-                <p className="text-xs text-slate-500 mt-1">
-                  <bdi dir="auto">{name}</bdi>
-                </p>
-              </div>
-              <button
-                type="button"
-                aria-label={isRtl ? 'إغلاق نافذة الدفع' : 'Close checkout modal'}
-                onClick={() => setShowCheckoutModal(false)}
-                className="w-9 h-9 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 flex items-center justify-center font-bold text-sm cursor-pointer shrink-0"
-              >
-                ✕
-              </button>
-            </div>
-
-            {/* Dual Currency & Exact EGP Settlement Box (TASK-012) */}
-            <div className="p-4 rounded-2xl bg-slate-50 border border-slate-200 space-y-2">
-              <div className="flex items-center justify-between text-xs text-slate-600">
-                <span>{isRtl ? 'المبلغ المستحق للدفع (Charge Amount):' : 'Exact Settlement Charge:'}</span>
-                <span dir="ltr" className="font-mono font-extrabold text-sm text-[#2F6BFF]">
-                  {formatExactEgpCharge(pricing.effectivePriceEgp, 'en')} — Charged in EGP via XPay
-                </span>
-              </div>
-              <div className="flex items-center justify-between text-xs text-slate-500">
-                <span>{isRtl ? 'المعادل التقريبي بالدولار:' : 'Approximate USD Equivalent:'}</span>
-                <span dir="ltr" className="font-mono font-bold text-slate-700">
-                  {formatPrice(pricing.effectivePriceEgp, 'USD', lang, settings.usd_rate)}
-                </span>
-              </div>
-              <p className="text-[11px] text-slate-500 pt-1 border-t border-slate-200/80">
-                {isRtl
-                  ? `سيتم تحصيل مبلغ ${formatExactEgpCharge(pricing.effectivePriceEgp, 'ar')} بالجنيه المصري عبر بوابة XPay الآمنة، وإرسال ملفات النظام فوراً لبريدك الإلكتروني.`
-                  : `Your card/wallet will be charged exactly ${formatExactEgpCharge(pricing.effectivePriceEgp, 'en')} in EGP via XPay, and workflow deliverables will be sent immediately to your email.`}
-              </p>
-            </div>
-
-            {buyNoticeText && (settings.buy_notice_enabled ?? true) && (
-              <div className="p-3.5 bg-blue-50/90 border border-blue-200 rounded-xl flex items-start gap-2.5 text-blue-900 text-xs">
-                <Info className="w-4 h-4 text-[#2F6BFF] shrink-0 mt-0.5" />
-                <span>{buyNoticeText}</span>
-              </div>
-            )}
-
-            <form
-              className="space-y-4"
-              onSubmit={async e => {
-                e.preventDefault();
-                setCheckoutError(null);
-                setCheckoutLoading(true);
-                try {
-                  const orderRes = await createCheckoutOrder({
-                    product_id: product.id,
-                    customer_name: customerName.trim(),
-                    customer_email: customerEmail.trim(),
-                    customer_phone: customerPhone.trim(),
-                    website_url: websiteUrl
-                  });
-                  if (orderRes?.redirect_url) {
-                    window.location.href = orderRes.redirect_url;
-                  }
-                } catch (err: any) {
-                  setCheckoutError(
-                    err?.message ||
-                      (isRtl
-                        ? 'تعذر إنشاء الطلب حالياً. يرجى التحقق من البيانات والمحاولة مرة أخرى.'
-                        : 'Could not initialize order. Please check your details and try again.')
-                  );
-                } finally {
-                  setCheckoutLoading(false);
-                }
-              }}
-            >
-              {/* Hidden Honeypot Field (TASK-007) */}
-              <div className="hidden" aria-hidden="true">
-                <input
-                  type="text"
-                  name="website_url"
-                  tabIndex={-1}
-                  autoComplete="off"
-                  value={websiteUrl}
-                  onChange={e => setWebsiteUrl(e.target.value)}
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-700 block">
-                  {isRtl ? 'الاسم الكامل *' : 'Full Name *'}
-                </label>
-                <input
-                  type="text"
-                  required
-                  minLength={2}
-                  maxLength={120}
-                  value={customerName}
-                  onChange={e => setCustomerName(e.target.value)}
-                  placeholder={isRtl ? 'أحمد محمد' : 'Ahmed Mohamed'}
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-slate-900 text-sm focus:outline-hidden focus:border-[#2F6BFF]"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-700 block">
-                  {isRtl ? 'البريد الإلكتروني لاستلام ملفات النظام *' : 'Delivery Email Address *'}
-                </label>
-                <input
-                  type="email"
-                  dir="ltr"
-                  required
-                  value={customerEmail}
-                  onChange={e => setCustomerEmail(e.target.value)}
-                  placeholder="name@company.com"
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-slate-900 text-sm font-mono focus:outline-hidden focus:border-[#2F6BFF]"
-                />
-              </div>
-
-              <div className="space-y-1.5">
-                <label className="text-xs font-bold text-slate-700 block">
-                  {isRtl ? 'رقم الهاتف / واتساب *' : 'Phone / WhatsApp Number *'}
-                </label>
-                <input
-                  type="tel"
-                  dir="ltr"
-                  required
-                  value={customerPhone}
-                  onChange={e => setCustomerPhone(e.target.value)}
-                  placeholder="+201000000000"
-                  className="w-full px-3.5 py-2.5 rounded-xl border border-slate-300 text-slate-900 text-sm font-mono focus:outline-hidden focus:border-[#2F6BFF]"
-                />
-              </div>
-
-              {checkoutError && (
-                <div className="p-3 rounded-xl bg-red-50 border border-red-200 text-red-700 text-xs font-semibold">
-                  {checkoutError}
-                </div>
-              )}
-
-              <div className="flex items-center justify-end gap-3 pt-2">
-                <button
-                  type="button"
-                  onClick={() => setShowCheckoutModal(false)}
-                  className="px-4 py-2.5 rounded-xl border border-slate-200 text-slate-600 hover:bg-slate-100 text-xs font-bold cursor-pointer"
-                >
-                  {isRtl ? 'إلغاء' : 'Cancel'}
-                </button>
-                <button
-                  type="submit"
-                  disabled={checkoutLoading}
-                  className="px-6 py-3 rounded-xl bg-[#2F6BFF] hover:bg-[#1a56e8] disabled:opacity-60 text-white text-xs sm:text-sm font-extrabold flex items-center gap-2 shadow-md cursor-pointer"
-                >
-                  <span>
-                    {checkoutLoading
-                      ? isRtl
-                        ? 'جاري تجهيز بوابة الدفع...'
-                        : 'Preparing secure checkout...'
-                      : isRtl
-                      ? `متابعة الدفع (${formatExactEgpCharge(pricing.effectivePriceEgp, 'ar')})`
-                      : `Proceed to XPay (${formatExactEgpCharge(pricing.effectivePriceEgp, 'en')})`}
-                  </span>
-                  <Zap className="w-4 h-4 text-amber-300 fill-amber-300" />
-                </button>
-              </div>
-            </form>
-          </div>
-        </div>
-      )}
 
       {/* Interactive Lightbox Modal with Full Zoom Controls */}
       {showDiagramModal && (diagramImageUrl || coverImageUrl) && (

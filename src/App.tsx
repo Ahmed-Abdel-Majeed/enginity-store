@@ -267,7 +267,7 @@ export default function App() {
       if (detailsMatch) {
         setIsDetailsRoute(true);
         const slug = detailsMatch[2];
-        const p = await fetchProductBySlug(slug, !isUserAdmin);
+        const p = await fetchProductBySlug(slug, { publishedOnly: !isUserAdmin });
         setSelectedProduct(p);
       } else {
         setIsDetailsRoute(false);

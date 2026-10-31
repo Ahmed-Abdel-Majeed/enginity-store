@@ -241,34 +241,39 @@ export async function fetchProducts(
   const throwOnError = !isBoolean && Boolean(optionsOrIncludeAll?.throwOnError);
 
   if (includeAllStatuses) {
-    const { client } = await requireVerifiedAdminClient();
-    const { data, error } = await client
-      .from('products')
-      .select(ADMIN_PRODUCT_COLUMNS)
-      .order('sort_order', { ascending: true });
-
-    if (error) {
-      if (throwOnError) throw new Error(error.message);
-      return [];
-    }
-
-    const delivMap = new Map<string, string>();
     try {
-      const { data: deliverables } = await client
-        .from('product_deliverables')
-        .select('product_id, file_url');
-      for (const d of deliverables || []) {
-        if (d?.product_id) {
-          delivMap.set(d.product_id, d.file_url || '');
-        }
-      }
-    } catch {
-      // Ignore if table not yet migrated
-    }
+      const { client } = await requireVerifiedAdminClient();
+      const { data, error } = await client
+        .from('products')
+        .select(ADMIN_PRODUCT_COLUMNS)
+        .order('sort_order', { ascending: true });
 
-    return (data || []).map((row: any) =>
-      normalizeAdminProduct(row, delivMap.get(row.id))
-    );
+      if (error) {
+        if (throwOnError) throw new Error(error.message);
+        return [];
+      }
+
+      const delivMap = new Map<string, string>();
+      try {
+        const { data: deliverables } = await client
+          .from('product_deliverables')
+          .select('product_id, file_url');
+        for (const d of deliverables || []) {
+          if (d?.product_id) {
+            delivMap.set(d.product_id, d.file_url || '');
+          }
+        }
+      } catch {
+        // Ignore if table not yet migrated
+      }
+
+      return (data || []).map((row: any) =>
+        normalizeAdminProduct(row, delivMap.get(row.id))
+      );
+    } catch (err) {
+      if (throwOnError) throw err;
+      // Fall back to public storefront query below if admin session expired
+    }
   }
 
   // Public storefront query: explicitly select only public columns (no file_url, no admin_notes)
@@ -288,37 +293,49 @@ export async function fetchProducts(
 
 export async function fetchProductBySlug(
   slug: string,
-  includeAllStatuses = false
+  publishedOnlyOrOptions: boolean | FetchProductsOptions = true
 ): Promise<Product | null> {
   if (!isSupabaseConfigured() || !slug) {
     return null;
   }
 
+  const includeAllStatuses =
+    typeof publishedOnlyOrOptions === 'boolean'
+      ? !publishedOnlyOrOptions
+      : Boolean(
+          publishedOnlyOrOptions?.includeAllStatuses ||
+            publishedOnlyOrOptions?.publishedOnly === false
+        );
+
   if (includeAllStatuses) {
-    const { client } = await requireVerifiedAdminClient();
-    const { data, error } = await client
-      .from('products')
-      .select(ADMIN_PRODUCT_COLUMNS)
-      .eq('slug', slug)
-      .maybeSingle();
-
-    if (error || !data) return null;
-
-    let fileUrl = (data as any).file_url || '';
     try {
-      const { data: deliv } = await client
-        .from('product_deliverables')
-        .select('file_url')
-        .eq('product_id', (data as any).id)
+      const { client } = await requireVerifiedAdminClient();
+      const { data, error } = await client
+        .from('products')
+        .select(ADMIN_PRODUCT_COLUMNS)
+        .eq('slug', slug)
         .maybeSingle();
-      if (deliv?.file_url) {
-        fileUrl = deliv.file_url;
-      }
-    } catch {
-      // Ignore
-    }
 
-    return normalizeAdminProduct(data, fileUrl);
+      if (error || !data) return null;
+
+      let fileUrl = (data as any).file_url || '';
+      try {
+        const { data: deliv } = await client
+          .from('product_deliverables')
+          .select('file_url')
+          .eq('product_id', (data as any).id)
+          .maybeSingle();
+        if (deliv?.file_url) {
+          fileUrl = deliv.file_url;
+        }
+      } catch {
+        // Ignore
+      }
+
+      return normalizeAdminProduct(data, fileUrl);
+    } catch {
+      // Fall back to public storefront query below if user is not an active admin
+    }
   }
 
   const { data, error } = await supabase

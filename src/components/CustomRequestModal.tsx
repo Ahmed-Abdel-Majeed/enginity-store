@@ -14,6 +14,12 @@ import {
 } from 'lucide-react';
 import { Lang } from '../types';
 import { submitCustomRequest } from '../lib/data-store';
+import {
+  checkSubmissionCooldown,
+  recordSubmissionTimestamp,
+  isHoneypotTriggered
+} from '../lib/validation';
+import { useModalA11y } from '../lib/use-modal-a11y';
 
 interface CustomRequestModalProps {
   isOpen: boolean;
@@ -58,16 +64,28 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
   const [deliveryTimeframe, setDeliveryTimeframe] = useState('');
   const [additionalNotes, setAdditionalNotes] = useState('');
   const [marketingConsent, setMarketingConsent] = useState(true);
+  const [honeypot, setHoneypot] = useState('');
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [submitted, setSubmitted] = useState<{ message: string; requestId?: string } | null>(null);
 
+  const resetAndClose = () => {
+    setSubmitted(null);
+    setError(null);
+    onClose();
+  };
+
+  const dialogRef = useModalA11y<HTMLDivElement>({
+    isOpen,
+    onClose: resetAndClose
+  });
+
   useEffect(() => {
-    if (isOpen && prefillTopic && !businessProblem) {
+    if (isOpen && prefillTopic) {
       setBusinessProblem(prefillTopic);
     }
-  }, [isOpen, prefillTopic, businessProblem]);
+  }, [isOpen, prefillTopic]);
 
   if (!isOpen) return null;
 
@@ -80,6 +98,25 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
+    if (isHoneypotTriggered(honeypot)) {
+      setSubmitted({
+        message: isAr
+          ? 'تم استلام طلب الأتمتة المخصص بنجاح! سيتواصل معك فريقنا الهندسي قريباً.'
+          : 'Your custom automation request has been received!'
+      });
+      return;
+    }
+
+    const cooldown = checkSubmissionCooldown('custom_request');
+    if (!cooldown.allowed) {
+      setError(
+        isAr
+          ? `يرجى الانتظار ${cooldown.remainingSeconds} ثانية قبل إرسال طلب آخر.`
+          : `Please wait ${cooldown.remainingSeconds} seconds before submitting another request.`
+      );
+      return;
+    }
 
     if (!email.trim() || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email.trim())) {
       setError(
@@ -133,12 +170,14 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
         delivery_timeframe: deliveryTimeframe.trim(),
         additional_notes: additionalNotes.trim(),
         marketing_consent: marketingConsent,
-        lang
+        lang,
+        website_url: honeypot
       });
 
       if (!res.success) {
         setError(res.message);
       } else {
+        recordSubmissionTimestamp('custom_request');
         setSubmitted({ message: res.message, requestId: res.requestId });
       }
     } catch {
@@ -152,12 +191,6 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
     }
   };
 
-  const resetAndClose = () => {
-    setSubmitted(null);
-    setError(null);
-    onClose();
-  };
-
   return (
     <div
       className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-slate-950/80 backdrop-blur-md overflow-y-auto"
@@ -165,8 +198,13 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
       role="dialog"
       aria-modal="true"
       aria-labelledby="custom-request-modal-title"
+      onClick={resetAndClose}
     >
-      <div className="relative w-full max-w-2xl bg-[#0d1526] border border-slate-800 rounded-2xl shadow-2xl overflow-hidden my-8 max-h-[90vh] flex flex-col">
+      <div
+        ref={dialogRef}
+        onClick={e => e.stopPropagation()}
+        className="relative w-full max-w-2xl bg-[#0d1526] border border-slate-800 rounded-2xl shadow-2xl overflow-hidden my-8 max-h-[90dvh] flex flex-col"
+      >
         {/* Top Accent Line */}
         <div className="h-1 w-full bg-gradient-to-r from-[#2f6bff] via-[#19d3c5] to-[#2f6bff]" />
 
@@ -228,8 +266,24 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
             </div>
           ) : (
             <form id="custom-request-form" onSubmit={handleSubmit} className="space-y-4">
+              {/* Hidden Honeypot Input */}
+              <div className="hidden" aria-hidden="true">
+                <label htmlFor="custom-request-website-url">Website</label>
+                <input
+                  id="custom-request-website-url"
+                  type="text"
+                  tabIndex={-1}
+                  autoComplete="off"
+                  value={honeypot}
+                  onChange={e => setHoneypot(e.target.value)}
+                />
+              </div>
+
               {error && (
-                <div className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 flex items-start gap-2.5 text-red-300 text-xs">
+                <div
+                  role="alert"
+                  className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 flex items-start gap-2.5 text-red-300 text-xs"
+                >
                   <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
                   <span>{error}</span>
                 </div>
@@ -243,6 +297,7 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
                   </label>
                   <input
                     type="text"
+                    maxLength={100}
                     value={name}
                     onChange={e => setName(e.target.value)}
                     placeholder={isAr ? 'مثال: أحمد / شركة نماء' : 'e.g. Ahmed / Namaa Co.'}
@@ -259,6 +314,7 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
                   <input
                     type="email"
                     required
+                    maxLength={254}
                     value={email}
                     onChange={e => setEmail(e.target.value)}
                     placeholder="name@company.com"
@@ -275,6 +331,7 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
                   </label>
                   <input
                     type="tel"
+                    maxLength={20}
                     value={whatsappNumber}
                     onChange={e => setWhatsappNumber(e.target.value)}
                     placeholder="+2010..."
@@ -295,6 +352,7 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
                 <input
                   type="text"
                   required
+                  maxLength={120}
                   value={businessType}
                   onChange={e => setBusinessType(e.target.value)}
                   placeholder={
@@ -317,6 +375,7 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
                   <textarea
                     rows={3}
                     required
+                    maxLength={2000}
                     value={businessProblem}
                     onChange={e => setBusinessProblem(e.target.value)}
                     placeholder={
@@ -336,6 +395,7 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
                   <textarea
                     rows={3}
                     required
+                    maxLength={2000}
                     value={desiredOutcome}
                     onChange={e => setDesiredOutcome(e.target.value)}
                     placeholder={
@@ -376,6 +436,7 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
                 </div>
                 <input
                   type="text"
+                  maxLength={300}
                   value={customToolInput}
                   onChange={e => setCustomToolInput(e.target.value)}
                   placeholder={
@@ -437,6 +498,7 @@ export const CustomRequestModal: React.FC<CustomRequestModalProps> = ({
                 </label>
                 <textarea
                   rows={2}
+                  maxLength={2000}
                   value={additionalNotes}
                   onChange={e => setAdditionalNotes(e.target.value)}
                   placeholder={

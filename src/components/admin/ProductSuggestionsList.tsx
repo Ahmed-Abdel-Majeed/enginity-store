@@ -323,7 +323,7 @@ export const ProductSuggestionsList: React.FC<ProductSuggestionsListProps> = ({
               </span>
             </div>
             <div className="overflow-x-auto">
-              <table className="w-full text-right text-xs">
+              <table className="w-full text-start text-xs">
                 <thead>
                   <tr className="border-b border-slate-800 text-slate-400">
                     <th className="py-2 font-semibold">فكرة المنتج المقترح</th>
@@ -400,13 +400,13 @@ export const ProductSuggestionsList: React.FC<ProductSuggestionsListProps> = ({
       {/* Search & Status Filter */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="sm:col-span-2 relative">
-          <Search className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2" />
+          <Search className="w-4 h-4 text-slate-400 absolute start-3.5 top-1/2 -translate-y-1/2" />
           <input
             type="text"
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
             placeholder="ابحث باسم المنتج المقترح، المشكلة، المنصة، أو البريد الإلكتروني..."
-            className="w-full pr-10 pl-4 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-white text-xs focus:border-teal-500 focus:outline-none"
+            className="w-full ps-10 pe-4 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-white text-xs focus:border-teal-500 focus:outline-none"
           />
         </div>
         <select
@@ -437,7 +437,7 @@ export const ProductSuggestionsList: React.FC<ProductSuggestionsListProps> = ({
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
           {/* Left: Suggestions List */}
-          <div className="lg:col-span-5 space-y-2.5 max-h-[650px] overflow-y-auto pr-1">
+          <div className="lg:col-span-5 space-y-2.5 max-h-[650px] overflow-y-auto pe-1">
             {filtered.map(item => {
               const isSelected = selectedSuggestion?.id === item.id;
               const statusBadge =
@@ -452,7 +452,7 @@ export const ProductSuggestionsList: React.FC<ProductSuggestionsListProps> = ({
                   key={item.id}
                   type="button"
                   onClick={() => selectSuggestion(item)}
-                  className={`w-full text-right p-4 rounded-xl border transition-all space-y-2 ${
+                  className={`w-full text-start p-4 rounded-xl border transition-all space-y-2 ${
                     isSelected
                       ? 'bg-teal-500/10 border-teal-500/50 shadow-lg'
                       : 'bg-slate-900/70 border-slate-800 hover:border-slate-700'

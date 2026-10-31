@@ -2,6 +2,12 @@ import React, { useState } from 'react';
 import { Product, Lang } from '../types';
 import { Translations } from '../i18n/ar';
 import { registerWaitlistInterest } from '../lib/data-store';
+import {
+  checkSubmissionCooldown,
+  recordSubmissionTimestamp,
+  isHoneypotTriggered
+} from '../lib/validation';
+import { useModalA11y } from '../lib/use-modal-a11y';
 import { Bell, Mail, MessageCircle, X, CheckCircle2, ShieldCheck, Calendar, AlertCircle } from 'lucide-react';
 
 interface WaitlistModalProps {
@@ -14,16 +20,21 @@ interface WaitlistModalProps {
 export const WaitlistModal: React.FC<WaitlistModalProps> = ({
   product,
   lang,
-  t,
   onClose
 }) => {
   const isRtl = lang === 'ar';
   const name = isRtl ? product.name_ar : product.name_en;
 
+  const dialogRef = useModalA11y<HTMLDivElement>({
+    isOpen: true,
+    onClose
+  });
+
   const [emailConsent, setEmailConsent] = useState(false);
   const [whatsappConsent, setWhatsappConsent] = useState(false);
   const [email, setEmail] = useState('');
   const [whatsappNumber, setWhatsappNumber] = useState('');
+  const [honeypot, setHoneypot] = useState('');
   
   const [loading, setLoading] = useState(false);
   const [errorMessage, setErrorMessage] = useState('');
@@ -33,6 +44,25 @@ export const WaitlistModal: React.FC<WaitlistModalProps> = ({
     e.preventDefault();
     setErrorMessage('');
     setSuccessMessage('');
+
+    if (isHoneypotTriggered(honeypot)) {
+      setSuccessMessage(
+        isRtl
+          ? 'تم تسجيل اهتمامك بنجاح! سنقوم بإشعارك فور إطلاق المنتج.'
+          : 'Your interest has been registered! We will notify you as soon as this product launches.'
+      );
+      return;
+    }
+
+    const cooldown = checkSubmissionCooldown(`waitlist_${product.id}`);
+    if (!cooldown.allowed) {
+      setErrorMessage(
+        isRtl
+          ? `يرجى الانتظار ${cooldown.remainingSeconds} ثانية قبل إرسال طلب آخر.`
+          : `Please wait ${cooldown.remainingSeconds} seconds before submitting again.`
+      );
+      return;
+    }
 
     if (!emailConsent && !whatsappConsent) {
       setErrorMessage(
@@ -66,15 +96,17 @@ export const WaitlistModal: React.FC<WaitlistModalProps> = ({
         whatsappNumber: whatsappConsent ? whatsappNumber.trim() : undefined,
         emailConsent,
         whatsappConsent,
-        lang
+        lang,
+        website_url: honeypot
       });
 
       if (res.success) {
+        recordSubmissionTimestamp(`waitlist_${product.id}`);
         setSuccessMessage(res.message);
       } else {
         setErrorMessage(res.message);
       }
-    } catch (err) {
+    } catch {
       setErrorMessage(isRtl ? 'حدث خطأ أثناء التسجيل. حاول مرة أخرى.' : 'Registration error. Please try again.');
     } finally {
       setLoading(false);
@@ -84,10 +116,15 @@ export const WaitlistModal: React.FC<WaitlistModalProps> = ({
   return (
     <div
       className="fixed inset-0 z-50 bg-slate-950/80 backdrop-blur-md flex items-center justify-center p-4 font-cairo animate-in fade-in duration-200"
+      dir={isRtl ? 'rtl' : 'ltr'}
+      role="dialog"
+      aria-modal="true"
+      aria-labelledby="waitlist-modal-title"
       onClick={onClose}
     >
       <div
-        className="bg-white rounded-3xl max-w-lg w-full p-6 sm:p-8 space-y-6 shadow-2xl border border-slate-200 relative text-start overflow-hidden"
+        ref={dialogRef}
+        className="bg-white rounded-3xl max-w-lg w-full max-h-[90dvh] overflow-y-auto p-6 sm:p-8 space-y-6 shadow-2xl border border-slate-200 relative text-start"
         onClick={e => e.stopPropagation()}
       >
         {/* Header Bar */}
@@ -97,7 +134,7 @@ export const WaitlistModal: React.FC<WaitlistModalProps> = ({
               <Bell className="w-5 h-5" />
             </div>
             <div>
-              <h3 className="font-heading font-black text-lg text-slate-900 leading-snug">
+              <h3 id="waitlist-modal-title" className="font-heading font-black text-lg text-slate-900 leading-snug">
                 {isRtl ? 'تنبيهي عند إطلاق المنتج' : 'Notify Me at Launch'}
               </h3>
               <p className="text-xs text-slate-500 font-medium">
@@ -109,8 +146,9 @@ export const WaitlistModal: React.FC<WaitlistModalProps> = ({
           <button
             type="button"
             onClick={onClose}
+            aria-label={isRtl ? 'إغلاق' : 'Close'}
             className="p-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-600 transition-colors cursor-pointer"
-            title="إغلاق"
+            title={isRtl ? 'إغلاق' : 'Close'}
           >
             <X className="w-5 h-5" />
           </button>
@@ -170,9 +208,24 @@ export const WaitlistModal: React.FC<WaitlistModalProps> = ({
           </div>
         ) : (
           <form onSubmit={handleSubmit} className="space-y-5">
-            
+            {/* Hidden Honeypot Input */}
+            <div className="hidden" aria-hidden="true">
+              <label htmlFor="waitlist-website-url">Website</label>
+              <input
+                id="waitlist-website-url"
+                type="text"
+                tabIndex={-1}
+                autoComplete="off"
+                value={honeypot}
+                onChange={e => setHoneypot(e.target.value)}
+              />
+            </div>
+
             {errorMessage && (
-              <div className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs font-semibold flex items-center gap-2">
+              <div
+                role="alert"
+                className="p-3.5 bg-red-50 border border-red-200 rounded-xl text-red-700 text-xs font-semibold flex items-center gap-2"
+              >
                 <AlertCircle className="w-4 h-4 text-red-600 shrink-0" />
                 <span>{errorMessage}</span>
               </div>
@@ -203,6 +256,8 @@ export const WaitlistModal: React.FC<WaitlistModalProps> = ({
               {emailConsent && (
                 <input
                   type="email"
+                  dir="ltr"
+                  maxLength={254}
                   value={email}
                   onChange={e => setEmail(e.target.value)}
                   placeholder="name@example.com"
@@ -237,6 +292,8 @@ export const WaitlistModal: React.FC<WaitlistModalProps> = ({
                 <div>
                   <input
                     type="tel"
+                    dir="ltr"
+                    maxLength={20}
                     value={whatsappNumber}
                     onChange={e => setWhatsappNumber(e.target.value)}
                     placeholder={isRtl ? '01012345678 أو +201012345678' : '+201012345678'}

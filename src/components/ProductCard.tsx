@@ -1,7 +1,7 @@
 import React from 'react';
 import { Currency, Lang, Product, ProductRatingSummary } from '../types';
 import { Translations } from '../i18n/ar';
-import { formatEGPPrice, formatUSDPrice, resolveProductPricing } from '../lib/utils';
+import { formatEGPPrice, formatPrice, resolveProductPricing } from '../lib/utils';
 import { ArrowLeft, ArrowRight, CheckCircle2, Sparkles, Bell, Calendar, Star, Tag } from 'lucide-react';
 
 interface ProductCardProps {
@@ -194,24 +194,23 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
                 </div>
 
                 {pricing.hasDiscount && (
-                  <div className="text-xs text-slate-400 line-through font-mono-code">
-                    {currency === 'EGP'
-                      ? `${formatEGPPrice(pricing.originalPriceEgp)} ${t.egpUnit}`
-                      : `${formatUSDPrice(pricing.originalPriceEgp, usdRate)} (${formatEGPPrice(pricing.originalPriceEgp)} ${t.egpUnit})`}
+                  <div dir="ltr" className="text-xs text-slate-400 line-through font-mono-code inline-block">
+                    {formatPrice(pricing.originalPriceEgp, currency, lang, usdRate)}
                   </div>
                 )}
 
                 <div className="font-heading font-extrabold text-2xl text-slate-900 flex items-baseline gap-1">
                   {currency === 'EGP' ? (
-                    <>
-                      <span className="text-[#2F6BFF] font-mono-code">{formatEGPPrice(pricing.effectivePriceEgp)}</span>
-                      <span className="text-sm text-slate-600 font-normal">{t.egpUnit}</span>
-                    </>
+                    <span dir="ltr" className="text-[#2F6BFF] font-mono-code">
+                      {formatPrice(pricing.effectivePriceEgp, 'EGP', lang, usdRate)}
+                    </span>
                   ) : (
                     <>
-                      <span className="text-[#2F6BFF] font-mono-code">{formatUSDPrice(pricing.effectivePriceEgp, usdRate)}</span>
-                      <span className="text-xs text-slate-500 font-normal ms-1">
-                        ({formatEGPPrice(pricing.effectivePriceEgp)} {t.egpUnit})
+                      <span dir="ltr" className="text-[#2F6BFF] font-mono-code">
+                        {formatPrice(pricing.effectivePriceEgp, 'USD', lang, usdRate)}
+                      </span>
+                      <span dir="ltr" className="text-xs text-slate-500 font-normal ms-1">
+                        ({formatEGPPrice(pricing.effectivePriceEgp, lang)})
                       </span>
                     </>
                   )}
@@ -365,24 +364,23 @@ const ProductCardComponent: React.FC<ProductCardProps> = ({
           </div>
 
           {pricing.hasDiscount && (
-            <div className="text-[11px] text-slate-400 line-through font-mono-code">
-              {currency === 'EGP'
-                ? `${formatEGPPrice(pricing.originalPriceEgp)} ${t.egpUnit}`
-                : `${formatUSDPrice(pricing.originalPriceEgp, usdRate)}`}
+            <div dir="ltr" className="text-[11px] text-slate-400 line-through font-mono-code inline-block">
+              {formatPrice(pricing.originalPriceEgp, currency, lang, usdRate)}
             </div>
           )}
 
           <div className="font-heading font-extrabold text-base sm:text-lg text-slate-900 flex items-baseline gap-1">
             {currency === 'EGP' ? (
-              <>
-                <span className="text-[#2F6BFF] font-mono-code">{formatEGPPrice(pricing.effectivePriceEgp)}</span>
-                <span className="text-xs text-slate-600 font-normal">{t.egpUnit}</span>
-              </>
+              <span dir="ltr" className="text-[#2F6BFF] font-mono-code">
+                {formatPrice(pricing.effectivePriceEgp, 'EGP', lang, usdRate)}
+              </span>
             ) : (
               <>
-                <span className="text-[#2F6BFF] font-mono-code">{formatUSDPrice(pricing.effectivePriceEgp, usdRate)}</span>
-                <span className="text-[10px] text-slate-500 font-normal ms-1">
-                  ({formatEGPPrice(pricing.effectivePriceEgp)} {t.egpUnit})
+                <span dir="ltr" className="text-[#2F6BFF] font-mono-code">
+                  {formatPrice(pricing.effectivePriceEgp, 'USD', lang, usdRate)}
+                </span>
+                <span dir="ltr" className="text-[10px] text-slate-500 font-normal ms-1">
+                  ({formatEGPPrice(pricing.effectivePriceEgp, lang)})
                 </span>
               </>
             )}

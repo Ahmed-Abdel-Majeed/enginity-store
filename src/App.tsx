@@ -1,4 +1,4 @@
-import React, { useEffect, useState, lazy, Suspense } from 'react';
+import React, { useEffect, useState, lazy, Suspense, useRef } from 'react';
 import Cookies from 'js-cookie';
 import { Category, Currency, Lang, Product, ProductRatingSummary, StoreSettings } from './types';
 import { ar } from './i18n/ar';
@@ -11,7 +11,6 @@ import { HowItWorks } from './components/HowItWorks';
 import { AuthorCard } from './components/AuthorCard';
 import { GeneralFaq } from './components/GeneralFaq';
 import { Footer } from './components/Footer';
-import { FloatingWhatsApp } from './components/FloatingWhatsApp';
 import { ProductDetailsView } from './components/ProductDetailsView';
 import { WaitlistModal } from './components/WaitlistModal';
 import { CustomRequestModal } from './components/CustomRequestModal';
@@ -19,7 +18,7 @@ import { ProductSuggestionModal } from './components/ProductSuggestionModal';
 import { AiShoppingAssistant } from './components/AiShoppingAssistant';
 import { NotFound } from './components/NotFound';
 import { SetupBanner } from './components/SetupBanner';
-import { Wrench, Lightbulb, Bot } from 'lucide-react';
+import { Wrench, Lightbulb, Bot, RotateCcw } from 'lucide-react';
 import type { AdminTabType } from './components/admin/AdminLayout';
 
 // Lazy load Admin components to keep public bundles small
@@ -48,7 +47,7 @@ import {
   updateStoreSettings
 } from './lib/data-store';
 
-import { supabase, isSupabaseConfigured } from './lib/supabase';
+import { supabase, isSupabaseConfigured, verifyAdminSession } from './lib/supabase';
 
 export default function App() {
   // Check if Supabase is configured
@@ -58,6 +57,7 @@ export default function App() {
 
   // Navigation & URL Path parsing
   const [pathname, setPathname] = useState(window.location.pathname);
+  const [locationSearch, setLocationSearch] = useState(window.location.search);
   
   // App State
   const [lang, setLang] = useState<Lang>('ar');
@@ -71,9 +71,12 @@ export default function App() {
   const [activeWaitlistProduct, setActiveWaitlistProduct] = useState<Product | null>(null);
   const [isDetailsRoute, setIsDetailsRoute] = useState(false);
   
-  // Search & Filter
+  // Search & Filter (Initialized from URL query params if present)
   const [selectedCategoryId, setSelectedCategoryId] = useState<number | null>(null);
-  const [searchQuery, setSearchQuery] = useState<string>('');
+  const [searchQuery, setSearchQuery] = useState<string>(() => {
+    const params = new URLSearchParams(window.location.search);
+    return params.get('q') || '';
+  });
 
   // Evolution Feature Modals & Assistant Drawer State
   const [isAssistantOpen, setIsAssistantOpen] = useState(false);
@@ -84,19 +87,101 @@ export default function App() {
 
   // Admin State
   const [isAdminAuth, setIsAdminAuth] = useState(false);
+  const [adminAuthError, setAdminAuthError] = useState<string | null>(null);
   const [adminTab, setAdminTab] = useState<AdminTabType>('products');
   const [editingProduct, setEditingProduct] = useState<Product | null>(null);
 
   const [loading, setLoading] = useState(true);
+  const isInitialSearchSyncRef = useRef(true);
 
-  // Handle URL location changes
+  // Handle URL location changes (back/forward navigation)
   useEffect(() => {
     const handlePopState = () => {
       setPathname(window.location.pathname);
+      setLocationSearch(window.location.search);
+      const params = new URLSearchParams(window.location.search);
+      setSearchQuery(params.get('q') || '');
     };
     window.addEventListener('popstate', handlePopState);
     return () => window.removeEventListener('popstate', handlePopState);
   }, []);
+
+  // Resolve ?category=<slug|id> once categories are loaded or when locationSearch changes
+  useEffect(() => {
+    if (categories.length === 0) return;
+    const params = new URLSearchParams(locationSearch);
+    const catParam = params.get('category');
+    if (!catParam) {
+      setSelectedCategoryId(null);
+      return;
+    }
+    const matchedBySlug = categories.find(
+      c => c.slug.toLowerCase() === catParam.toLowerCase()
+    );
+    if (matchedBySlug) {
+      setSelectedCategoryId(matchedBySlug.id);
+      return;
+    }
+    const numericId = Number(catParam);
+    if (Number.isInteger(numericId)) {
+      const matchedById = categories.find(c => c.id === numericId);
+      setSelectedCategoryId(matchedById ? matchedById.id : null);
+    }
+  }, [categories, locationSearch]);
+
+  // Debounced sync of searchQuery -> ?q= URL parameter (TASK-011)
+  useEffect(() => {
+    if (isInitialSearchSyncRef.current) {
+      isInitialSearchSyncRef.current = false;
+      return;
+    }
+    if (pathname.startsWith('/admin') || isDetailsRoute) return;
+
+    const timer = window.setTimeout(() => {
+      const params = new URLSearchParams(window.location.search);
+      const trimmed = searchQuery.trim();
+      if (trimmed) {
+        params.set('q', trimmed);
+      } else {
+        params.delete('q');
+      }
+      const nextSearch = params.toString();
+      const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+      window.history.replaceState({}, '', nextUrl);
+      setLocationSearch(nextSearch ? `?${nextSearch}` : '');
+    }, 200);
+
+    return () => window.clearTimeout(timer);
+  }, [searchQuery, pathname, isDetailsRoute]);
+
+  const handleSelectCategory = (categoryId: number | null) => {
+    setSelectedCategoryId(categoryId);
+    if (pathname.startsWith('/admin') || isDetailsRoute) return;
+
+    const params = new URLSearchParams(window.location.search);
+    if (categoryId === null) {
+      params.delete('category');
+    } else {
+      const catObj = categories.find(c => c.id === categoryId);
+      params.set('category', catObj?.slug || String(categoryId));
+    }
+    const nextSearch = params.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}${window.location.hash}`;
+    window.history.pushState({}, '', nextUrl);
+    setLocationSearch(nextSearch ? `?${nextSearch}` : '');
+  };
+
+  const handleResetFilters = () => {
+    setSearchQuery('');
+    setSelectedCategoryId(null);
+    const params = new URLSearchParams(window.location.search);
+    params.delete('q');
+    params.delete('category');
+    const nextSearch = params.toString();
+    const nextUrl = `${window.location.pathname}${nextSearch ? `?${nextSearch}` : ''}`;
+    window.history.pushState({}, '', nextUrl);
+    setLocationSearch(nextSearch ? `?${nextSearch}` : '');
+  };
 
   // Parse path & redirects
   useEffect(() => {
@@ -104,7 +189,8 @@ export default function App() {
 
     // Root redirect to /ar
     if (path === '/' || path === '') {
-      window.history.replaceState({}, '', '/ar');
+      const target = `/ar${window.location.search || ''}`;
+      window.history.replaceState({}, '', target);
       setPathname('/ar');
       setLang('ar');
       return;
@@ -129,25 +215,25 @@ export default function App() {
     document.documentElement.lang = lang;
   }, [lang]);
 
-  // Check active admin session in Supabase Auth & admins table
+  // Check active admin session in Supabase Auth & public.is_admin() / admins table (TASK-005)
   const checkAdminSession = async (): Promise<boolean> => {
     if (!supabase) return false;
     try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      if (!sessionData?.session?.user) return false;
+      const { isAdmin, accessToken, userId } = await verifyAdminSession();
+      if (!isAdmin || !accessToken) {
+        if (userId) {
+          // Signed in user is NOT an authorized admin — sign out immediately
+          await supabase.auth.signOut();
+          Cookies.remove('enginity_sb_token', { path: '/' });
+          localStorage.removeItem('enginity_sb_token');
+          setAdminAuthError('هذا الحساب غير مصرح له بصلاحيات المسؤول (Admin).');
+        }
+        return false;
+      }
 
-      const userId = sessionData.session.user.id;
-      const { data: adminRow, error: adminErr } = await supabase
-        .from('admins')
-        .select('user_id')
-        .eq('user_id', userId)
-        .single();
-
-      if (adminErr || !adminRow) return false;
-
-      // Set session cookie for Express server API routes and localStorage
-      Cookies.set('enginity_sb_token', sessionData.session.access_token, { expires: 7, path: '/' });
-      localStorage.setItem('enginity_sb_token', sessionData.session.access_token);
+      Cookies.set('enginity_sb_token', accessToken, { expires: 7, path: '/' });
+      localStorage.setItem('enginity_sb_token', accessToken);
+      setAdminAuthError(null);
       return true;
     } catch {
       return false;
@@ -200,7 +286,7 @@ export default function App() {
 
   const t = lang === 'ar' ? ar : en;
 
-  // Toggle Language
+  // Toggle Language (preserving query parameters)
   const handleToggleLang = (newLang: Lang) => {
     setLang(newLang);
     let newPath = pathname;
@@ -211,7 +297,8 @@ export default function App() {
     } else {
       newPath = `/${newLang}`;
     }
-    window.history.pushState({}, '', newPath);
+    const fullUrl = `${newPath}${window.location.search || ''}`;
+    window.history.pushState({}, '', fullUrl);
     setPathname(newPath);
   };
 
@@ -221,7 +308,7 @@ export default function App() {
     Cookies.set('enginity_currency', newCurrency, { expires: 365, path: '/' });
   };
 
-  // Admin Login Handler via Supabase Auth + admins check
+  // Admin Login Handler via Supabase Auth + verifyAdminSession (public.is_admin() / admins check)
   const handleAdminLogin = async (email: string, pass: string): Promise<boolean> => {
     if (!supabase) return false;
     try {
@@ -234,22 +321,20 @@ export default function App() {
         return false;
       }
 
-      const userId = authData.user.id;
-      const { data: adminRow, error: adminErr } = await supabase
-        .from('admins')
-        .select('user_id')
-        .eq('user_id', userId)
-        .single();
-
-      if (adminErr || !adminRow) {
+      const verification = await verifyAdminSession();
+      if (!verification.isAdmin || !verification.accessToken) {
         await supabase.auth.signOut();
+        Cookies.remove('enginity_sb_token', { path: '/' });
+        localStorage.removeItem('enginity_sb_token');
+        setAdminAuthError('هذا الحساب غير مدرج في قائمة مسؤولي النظام (public.admins).');
         return false;
       }
 
       // Store auth token in cookie and localStorage for server endpoints
-      Cookies.set('enginity_sb_token', authData.session.access_token, { expires: 7, path: '/' });
-      localStorage.setItem('enginity_sb_token', authData.session.access_token);
+      Cookies.set('enginity_sb_token', verification.accessToken, { expires: 7, path: '/' });
+      localStorage.setItem('enginity_sb_token', verification.accessToken);
 
+      setAdminAuthError(null);
       setIsAdminAuth(true);
       await loadData();
       return true;
@@ -308,10 +393,14 @@ export default function App() {
       </div>
     );
 
+    if (loading) {
+      return adminFallback;
+    }
+
     if (!isAdminAuth) {
       return (
         <Suspense fallback={adminFallback}>
-          <AdminLogin onLogin={handleAdminLogin} />
+          <AdminLogin onLogin={handleAdminLogin} initialError={adminAuthError} />
         </Suspense>
       );
     }
@@ -535,6 +624,7 @@ export default function App() {
             />
             <AiShoppingAssistant
               lang={lang}
+              currency={currency}
               settings={settings}
               isOpen={isAssistantOpen}
               onToggleOpen={setIsAssistantOpen}
@@ -558,7 +648,7 @@ export default function App() {
       p.name_en.toLowerCase().includes(q) ||
       (p.short_ar && p.short_ar.toLowerCase().includes(q)) ||
       (p.short_en && p.short_en.toLowerCase().includes(q)) ||
-      (p.tools && p.tools.some(t => t.toLowerCase().includes(q)));
+      (p.tools && p.tools.some(tool => tool.toLowerCase().includes(q)));
     return matchesCat && matchesSearch;
   });
 
@@ -601,30 +691,51 @@ export default function App() {
             searchQuery={searchQuery}
             lang={lang}
             t={t}
-            onSelectCategory={setSelectedCategoryId}
+            onSelectCategory={handleSelectCategory}
             onSearchChange={setSearchQuery}
             onClearSearch={() => setSearchQuery('')}
             totalResultsCount={filteredProducts.length}
           />
 
-          {/* Products Grid / Single Product Spotlight */}
+          {/* Products Grid / Single Product Spotlight / Actionable Empty Filter State */}
           {filteredProducts.length === 0 ? (
-            <div className="py-16 bg-white rounded-2xl border border-slate-200 text-slate-500 text-sm max-w-md mx-auto shadow-xs space-y-4 p-6">
-              <div>{t.noProductsFound}</div>
-              <div className="flex flex-wrap items-center justify-center gap-2 pt-2">
+            <div className="py-12 bg-white rounded-2xl border border-slate-200 text-slate-600 text-sm max-w-lg mx-auto shadow-xs space-y-5 p-6">
+              <div className="space-y-1.5">
+                <h3 className="font-heading font-extrabold text-base text-slate-900">
+                  {t.noProductsFound}
+                </h3>
+                <p className="text-xs text-slate-500">
+                  {lang === 'ar'
+                    ? 'يمكنك إعادة ضبط الفلاتر لعرض جميع القوالب المتاحة، أو طلب تصميم نظام أتمتة مخصص لاحتياجك.'
+                    : 'Reset filters to view all available workflows, or request a custom automation system tailored to your needs.'}
+                </p>
+              </div>
+              <div className="flex flex-wrap items-center justify-center gap-2.5 pt-1">
+                {(searchQuery.trim() !== '' || selectedCategoryId !== null) && (
+                  <button
+                    type="button"
+                    onClick={handleResetFilters}
+                    className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-900 hover:bg-slate-800 text-white text-xs font-bold transition-colors cursor-pointer"
+                  >
+                    <RotateCcw className="w-3.5 h-3.5" />
+                    <span>{lang === 'ar' ? 'إعادة ضبط الفلاتر' : 'Reset Filters'}</span>
+                  </button>
+                )}
                 <button
                   type="button"
-                  onClick={() => handleOpenCustomRequestModal(searchQuery)}
-                  className="px-4 py-2 rounded-xl bg-[#2F6BFF] hover:bg-blue-600 text-white text-xs font-bold transition-colors cursor-pointer"
+                  onClick={() => handleOpenCustomRequestModal(searchQuery.trim() || undefined)}
+                  className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-[#2F6BFF] hover:bg-blue-600 text-white text-xs font-bold transition-colors cursor-pointer"
                 >
-                  {t.customRequestBtn}
+                  <Wrench className="w-3.5 h-3.5" />
+                  <span>{t.customRequestBtn}</span>
                 </button>
                 <button
                   type="button"
-                  onClick={() => handleOpenProductSuggestionModal(searchQuery)}
-                  className="px-4 py-2 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold transition-colors cursor-pointer"
+                  onClick={() => handleOpenProductSuggestionModal(searchQuery.trim() || undefined)}
+                  className="inline-flex items-center gap-1.5 px-4 py-2.5 rounded-xl bg-slate-100 hover:bg-slate-200 text-slate-800 text-xs font-bold transition-colors cursor-pointer"
                 >
-                  {t.suggestProductBtn}
+                  <Lightbulb className="w-3.5 h-3.5" />
+                  <span>{t.suggestProductBtn}</span>
                 </button>
               </div>
             </div>
@@ -759,6 +870,7 @@ export default function App() {
           />
           <AiShoppingAssistant
             lang={lang}
+            currency={currency}
             settings={settings}
             isOpen={isAssistantOpen}
             onToggleOpen={setIsAssistantOpen}

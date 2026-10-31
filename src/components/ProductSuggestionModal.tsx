@@ -13,6 +13,12 @@ import {
 } from 'lucide-react';
 import { Lang, PurchaseLikelihood } from '../types';
 import { submitProductSuggestion } from '../lib/data-store';
+import {
+  checkSubmissionCooldown,
+  recordSubmissionTimestamp,
+  isHoneypotTriggered
+} from '../lib/validation';
+import { useModalA11y } from '../lib/use-modal-a11y';
 
 interface ProductSuggestionModalProps {
   isOpen: boolean;
@@ -56,6 +62,7 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
   const [preferredPriceRange, setPreferredPriceRange] = useState('');
   const [additionalContext, setAdditionalContext] = useState('');
   const [contactConsent, setContactConsent] = useState(true);
+  const [honeypot, setHoneypot] = useState('');
 
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -63,11 +70,22 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
     null
   );
 
+  const resetAndClose = () => {
+    setSubmitted(null);
+    setError(null);
+    onClose();
+  };
+
+  const dialogRef = useModalA11y<HTMLDivElement>({
+    isOpen,
+    onClose: resetAndClose
+  });
+
   useEffect(() => {
-    if (isOpen && prefillTopic && !problemSolved) {
+    if (isOpen && prefillTopic) {
       setProblemSolved(prefillTopic);
     }
-  }, [isOpen, prefillTopic, problemSolved]);
+  }, [isOpen, prefillTopic]);
 
   if (!isOpen) return null;
 
@@ -80,6 +98,25 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
     setError(null);
+
+    if (isHoneypotTriggered(honeypot)) {
+      setSubmitted({
+        message: isAr
+          ? 'شكراً لمشاركتك! تم تسجيل اقتراح المنتج في قاعدة بيانات تطوير المتجر.'
+          : 'Thank you! Your product suggestion has been recorded.'
+      });
+      return;
+    }
+
+    const cooldown = checkSubmissionCooldown('product_suggestion');
+    if (!cooldown.allowed) {
+      setError(
+        isAr
+          ? `يرجى الانتظار ${cooldown.remainingSeconds} ثانية قبل إرسال اقتراح آخر.`
+          : `Please wait ${cooldown.remainingSeconds} seconds before submitting another suggestion.`
+      );
+      return;
+    }
 
     if (!proposedName.trim() || !problemSolved.trim() || !targetAudience.trim()) {
       setError(
@@ -132,12 +169,14 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
         preferred_price_range: preferredPriceRange.trim(),
         additional_context: additionalContext.trim(),
         contact_consent: contactConsent,
-        lang
+        lang,
+        website_url: honeypot
       });
 
       if (!res.success) {
         setError(res.message);
       } else {
+        recordSubmissionTimestamp('product_suggestion');
         setSubmitted({ message: res.message, suggestionId: res.suggestionId });
       }
     } catch {
@@ -149,12 +188,6 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
     } finally {
       setLoading(false);
     }
-  };
-
-  const resetAndClose = () => {
-    setSubmitted(null);
-    setError(null);
-    onClose();
   };
 
   const likelihoodOptions: {
@@ -201,8 +234,13 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
       role="dialog"
       aria-modal="true"
       aria-labelledby="product-suggestion-modal-title"
+      onClick={resetAndClose}
     >
-      <div className="relative w-full max-w-2xl bg-[#0d1526] border border-slate-800 rounded-2xl shadow-2xl overflow-hidden my-8 max-h-[90vh] flex flex-col">
+      <div
+        ref={dialogRef}
+        onClick={e => e.stopPropagation()}
+        className="relative w-full max-w-2xl bg-[#0d1526] border border-slate-800 rounded-2xl shadow-2xl overflow-hidden my-8 max-h-[90dvh] flex flex-col"
+      >
         {/* Top Accent Line */}
         <div className="h-1 w-full bg-gradient-to-r from-[#19d3c5] via-[#2f6bff] to-[#19d3c5]" />
 
@@ -258,8 +296,24 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
             </div>
           ) : (
             <form id="product-suggestion-form" onSubmit={handleSubmit} className="space-y-4">
+              {/* Hidden Honeypot Input */}
+              <div className="hidden" aria-hidden="true">
+                <label htmlFor="product-suggestion-website-url">Website</label>
+                <input
+                  id="product-suggestion-website-url"
+                  type="text"
+                  tabIndex={-1}
+                  autoComplete="off"
+                  value={honeypot}
+                  onChange={e => setHoneypot(e.target.value)}
+                />
+              </div>
+
               {error && (
-                <div className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 flex items-start gap-2.5 text-red-300 text-xs">
+                <div
+                  role="alert"
+                  className="p-3.5 rounded-xl bg-red-500/10 border border-red-500/30 flex items-start gap-2.5 text-red-300 text-xs"
+                >
                   <AlertCircle className="w-4 h-4 text-red-400 shrink-0 mt-0.5" />
                   <span>{error}</span>
                 </div>
@@ -277,6 +331,7 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
                   <input
                     type="text"
                     required
+                    maxLength={150}
                     value={proposedName}
                     onChange={e => setProposedName(e.target.value)}
                     placeholder={
@@ -297,6 +352,7 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
                   <input
                     type="text"
                     required
+                    maxLength={150}
                     value={targetAudience}
                     onChange={e => setTargetAudience(e.target.value)}
                     placeholder={
@@ -318,6 +374,7 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
                   <textarea
                     rows={3}
                     required
+                    maxLength={2000}
                     value={problemSolved}
                     onChange={e => setProblemSolved(e.target.value)}
                     placeholder={
@@ -334,6 +391,7 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
                   </label>
                   <textarea
                     rows={3}
+                    maxLength={2000}
                     value={expectedFeatures}
                     onChange={e => setExpectedFeatures(e.target.value)}
                     placeholder={
@@ -372,6 +430,7 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
                 </div>
                 <input
                   type="text"
+                  maxLength={300}
                   value={customPlatform}
                   onChange={e => setCustomPlatform(e.target.value)}
                   placeholder={
@@ -433,6 +492,7 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
                   </label>
                   <input
                     type="email"
+                    maxLength={254}
                     value={email}
                     onChange={e => setEmail(e.target.value)}
                     placeholder="you@example.com"
@@ -449,6 +509,7 @@ export const ProductSuggestionModal: React.FC<ProductSuggestionModalProps> = ({
                   </label>
                   <input
                     type="tel"
+                    maxLength={20}
                     value={whatsappNumber}
                     onChange={e => setWhatsappNumber(e.target.value)}
                     placeholder="+2010..."

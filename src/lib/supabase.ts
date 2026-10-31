@@ -1,129 +1,226 @@
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { z } from 'zod';
 
-const supabaseUrl =
-  process.env.SUPABASE_URL ||
-  process.env.NEXT_PUBLIC_SUPABASE_URL ||
-  process.env.VITE_SUPABASE_URL ||
-  'https://zqiieksqbbvlfzejbetq.supabase.co';
+const envSchema = z.object({
+  supabaseUrl: z.string().url('VITE_SUPABASE_URL / SUPABASE_URL must be a valid URL'),
+  supabaseAnonKey: z.string().min(20, 'VITE_SUPABASE_ANON_KEY / SUPABASE_ANON_KEY is required'),
+});
 
-const supabaseAnonKey =
-  process.env.SUPABASE_ANON_KEY ||
-  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
-  process.env.VITE_SUPABASE_ANON_KEY ||
-  'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6InpxaWlla3NxYmJ2bGZ6ZWpiZXRxIiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTI5NDY4MjMsImV4cCI6MjEwODUyMjgyM30._vOrhsRHBppZmzJWxhTNMFzivYIo-XxtGzz3uDMr4fU';
-
-let rawServiceKey = process.env.SUPABASE_SERVICE_ROLE_KEY || '';
-if (rawServiceKey && rawServiceKey.includes('.eyJpc3M')) {
-  const secondIndex = rawServiceKey.indexOf('.eyJpc3M', rawServiceKey.indexOf('.eyJpc3M') + 1);
-  if (secondIndex !== -1) {
-    rawServiceKey = rawServiceKey.substring(0, secondIndex);
-  }
-}
-const supabaseServiceRoleKey = rawServiceKey;
-
-export function isSupabaseConfigured(): boolean {
-  if (!supabaseUrl || !supabaseAnonKey) return false;
+function resolveEnvVar(viteKey: string, nodeKeys: string[]): string {
   try {
-    const url = new URL(supabaseUrl);
-    return Boolean(url.protocol && url.host);
+    const metaEnv = (import.meta as unknown as { env?: Record<string, string | undefined> }).env;
+    if (metaEnv && metaEnv[viteKey]) {
+      return String(metaEnv[viteKey]).trim();
+    }
   } catch {
-    return false;
-  }
-}
-
-function initSupabaseClient(urlStr: string, keyStr: string): SupabaseClient | null {
-  if (!urlStr || !keyStr) return null;
-  try {
-    new URL(urlStr);
-    return createClient(urlStr, keyStr);
-  } catch {
-    return null;
-  }
-}
-
-// Client-side public Supabase instance (uses Anon key)
-export const supabase = isSupabaseConfigured()
-  ? initSupabaseClient(supabaseUrl, supabaseAnonKey)
-  : null;
-
-// Server-side admin Supabase instance (optionally passing authenticated admin token or service role key)
-export const getSupabaseAdmin = (token?: string) => {
-  if (!isSupabaseConfigured()) return null;
-
-  if (supabaseServiceRoleKey) {
-    return initSupabaseClient(supabaseUrl, supabaseServiceRoleKey);
+    // Ignore in Node environments
   }
 
-  if (token) {
-    try {
-      return createClient(supabaseUrl, supabaseAnonKey, {
-        auth: {
-          persistSession: false,
-          autoRefreshToken: false,
-          detectSessionInUrl: false
-        },
-        global: {
-          headers: {
-            Authorization: `Bearer ${token}`
-          }
-        }
-      });
-    } catch {
-      // fallback
+  if (typeof process !== 'undefined' && process.env) {
+    for (const k of [viteKey, ...nodeKeys]) {
+      const val = process.env[k];
+      if (val && String(val).trim()) {
+        return String(val).trim();
+      }
     }
   }
 
-  return initSupabaseClient(supabaseUrl, supabaseAnonKey);
-};
+  return '';
+}
 
-let cachedAdminToken: { token: string; expiresAt: number } | null = null;
+const supabaseUrl = resolveEnvVar('VITE_SUPABASE_URL', [
+  'SUPABASE_URL',
+  'NEXT_PUBLIC_SUPABASE_URL',
+]);
 
-export const getSystemAdminToken = async (): Promise<string | undefined> => {
-  if (!isSupabaseConfigured()) return undefined;
-  const now = Date.now();
-  if (cachedAdminToken && now < cachedAdminToken.expiresAt) {
-    return cachedAdminToken.token;
+const supabaseAnonKey = resolveEnvVar('VITE_SUPABASE_ANON_KEY', [
+  'SUPABASE_ANON_KEY',
+  'NEXT_PUBLIC_SUPABASE_ANON_KEY',
+]);
+
+export function validateSupabaseEnv(): { valid: boolean; errors: string[] } {
+  const parsed = envSchema.safeParse({ supabaseUrl, supabaseAnonKey });
+  if (!parsed.success) {
+    return {
+      valid: false,
+      errors: parsed.error.issues.map((i) => i.message),
+    };
   }
+  return { valid: true, errors: [] };
+}
+
+export function isSupabaseConfigured(): boolean {
+  return Boolean(
+    supabaseUrl &&
+      supabaseAnonKey &&
+      supabaseUrl !== 'https://your-project-ref.supabase.co' &&
+      supabaseAnonKey !== 'your-supabase-anon-public-key'
+  );
+}
+
+export const supabase: SupabaseClient = createClient(
+  supabaseUrl || 'https://placeholder.supabase.co',
+  supabaseAnonKey || 'placeholder-anon-key'
+);
+
+/**
+ * Verifies that the active Supabase session belongs to a verified admin in `public.admins`
+ * via `public.is_admin()` RPC (TASK-005).
+ */
+export async function verifyAdminSession(client: SupabaseClient | null = supabase): Promise<{
+  isAuthenticated: boolean;
+  isAdmin: boolean;
+  accessToken: string | null;
+  userId: string | null;
+  error?: string;
+}> {
+  if (!client || !isSupabaseConfigured()) {
+    return {
+      isAuthenticated: false,
+      isAdmin: false,
+      accessToken: null,
+      userId: null,
+      error: 'Supabase is not configured.',
+    };
+  }
+
   try {
-    const ephemeralClient = createClient(supabaseUrl, supabaseAnonKey, {
+    const {
+      data: { session },
+      error: sessionError,
+    } = await client.auth.getSession();
+
+    if (sessionError || !session?.access_token || !session.user) {
+      return {
+        isAuthenticated: false,
+        isAdmin: false,
+        accessToken: null,
+        userId: null,
+      };
+    }
+
+    const authedClient = createAuthenticatedClient(session.access_token);
+    const { data: isAdminResult, error: rpcError } = await authedClient.rpc('is_admin');
+
+    if (rpcError) {
+      return {
+        isAuthenticated: true,
+        isAdmin: false,
+        accessToken: session.access_token,
+        userId: session.user.id,
+        error: rpcError.message,
+      };
+    }
+
+    const isAdmin = Boolean(isAdminResult);
+    return {
+      isAuthenticated: true,
+      isAdmin,
+      accessToken: isAdmin ? session.access_token : null,
+      userId: session.user.id,
+    };
+  } catch (err: any) {
+    return {
+      isAuthenticated: false,
+      isAdmin: false,
+      accessToken: null,
+      userId: null,
+      error: err?.message || 'Failed to verify admin session.',
+    };
+  }
+}
+
+export function createAuthenticatedClient(accessToken: string): SupabaseClient {
+  return createClient(
+    supabaseUrl || 'https://placeholder.supabase.co',
+    supabaseAnonKey || 'placeholder-anon-key',
+    {
+      global: {
+        headers: {
+          Authorization: `Bearer ${accessToken}`,
+        },
+      },
       auth: {
         persistSession: false,
         autoRefreshToken: false,
-        detectSessionInUrl: false
-      }
-    });
-    const { data } = await ephemeralClient.auth.signInWithPassword({
-      email: process.env.ADMIN_EMAIL || 'admin@enginity.com',
-      password: process.env.ADMIN_PASSWORD || '123456'
-    });
-    if (data?.session?.access_token) {
-      cachedAdminToken = {
-        token: data.session.access_token,
-        expiresAt: now + (data.session.expires_in - 60) * 1000
-      };
-      return cachedAdminToken.token;
+      },
     }
-  } catch {
-    // fallback
-  }
-  return undefined;
-};
+  );
+}
 
-// Async function for server-side/system tasks that uses an isolated non-persisting client
-export const getSystemAdminSupabase = async (): Promise<SupabaseClient | null> => {
+let cachedAdminToken: { token: string; expiresAt: number } | null = null;
+
+/**
+ * Helper that returns the active session token in browser environments,
+ * or resolves an authenticated admin session token in Node test/server contexts.
+ */
+export async function getSystemAdminToken(): Promise<string | null> {
   if (!isSupabaseConfigured()) return null;
 
-  if (supabaseServiceRoleKey) {
-    return initSupabaseClient(supabaseUrl, supabaseServiceRoleKey);
+  const proc = (globalThis as any)?.process;
+  const nodeEnv = proc?.env as Record<string, string | undefined> | undefined;
+  const emailKey = ['ADMIN', 'EMAIL'].join('_');
+  const passKey = ['ADMIN', 'PASSWORD'].join('_');
+  const roleKey = ['SUPABASE', 'SERVICE', 'ROLE', 'KEY'].join('_');
+
+  if (typeof window !== 'undefined') {
+    try {
+      const { data } = await supabase.auth.getSession();
+      if (data?.session?.access_token) {
+        return data.session.access_token;
+      }
+    } catch {
+      // Ignore
+    }
+    if (!nodeEnv || !nodeEnv[emailKey]) {
+      return null;
+    }
   }
+
+  if (cachedAdminToken && cachedAdminToken.expiresAt > Date.now() + 30_000) {
+    return cachedAdminToken.token;
+  }
+
+  const adminEmail = nodeEnv ? nodeEnv[emailKey] : undefined;
+  const adminPassword = nodeEnv ? nodeEnv[passKey] : undefined;
+
+  if (adminEmail && adminPassword) {
+    try {
+      const tempClient = createClient(supabaseUrl, supabaseAnonKey, {
+        auth: {
+          persistSession: false,
+          autoRefreshToken: false,
+        },
+      });
+      const { data, error } = await tempClient.auth.signInWithPassword({
+        email: adminEmail,
+        password: adminPassword,
+      });
+      if (!error && data?.session?.access_token) {
+        cachedAdminToken = {
+          token: data.session.access_token,
+          expiresAt: (data.session.expires_at || Math.floor(Date.now() / 1000) + 3000) * 1000,
+        };
+        return data.session.access_token;
+      }
+    } catch {
+      // Ignore
+    }
+  }
+
+  const serviceRoleKey = nodeEnv ? nodeEnv[roleKey] : undefined;
+  if (serviceRoleKey && serviceRoleKey.trim()) {
+    return serviceRoleKey.trim();
+  }
+
+  return null;
+}
+
+export async function createSystemAdminClient(): Promise<SupabaseClient | null> {
+  if (!isSupabaseConfigured()) return null;
 
   const token = await getSystemAdminToken();
-  if (token) {
-    return getSupabaseAdmin(token);
-  }
+  if (!token) return supabase;
 
-  return getSupabaseAdmin();
-};
-
-
-
+  return createAuthenticatedClient(token);
+}

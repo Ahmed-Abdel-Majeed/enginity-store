@@ -1,1353 +1,1706 @@
-import 'dotenv/config';
+import dotenv from 'dotenv';
+const runtimePort = process.env.PORT;
+dotenv.config({ override: true });
 import express, { Request, Response, NextFunction } from 'express';
-import { createServer as createViteServer } from 'vite';
-import path from 'path';
-import fs from 'fs';
-import { fileURLToPath } from 'url';
-import { z } from 'zod';
+import crypto from 'crypto';
+import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { getEffectiveProductPricing } from './src/lib/utils';
 import {
-  fetchCategories,
-  fetchProducts,
-  fetchProductBySlug,
-  fetchSettings,
-  createProduct,
-  updateProduct,
-  deleteProduct,
-  createCategory,
-  updateCategory,
-  deleteCategory,
-  updateStoreSettings,
-  processProductLaunch
-} from './src/lib/data-store';
-import {
-  createCustomAutomationRequest,
-  listCustomAutomationRequests,
-  updateCustomAutomationRequest,
-  createProductSuggestion,
-  listProductSuggestions,
-  updateProductSuggestion,
-  computeDemandAnalytics,
-  createProductReview,
-  getProductReviewsAndSummary,
-  listAdminProductReviews,
-  moderateProductReview,
-  deleteProductReview
-} from './src/lib/crm-store';
-import { processAssistantTurn } from './src/lib/assistant-engine';
-import { validateXPayUrl, normalizeDateToIso } from './src/lib/utils';
-import { isSupabaseConfigured, getSupabaseAdmin, getSystemAdminSupabase, supabase } from './src/lib/supabase';
+  orderInitSchema,
+  waitlistSubmissionSchema,
+  customRequestSubmissionSchema,
+  productSuggestionSubmissionSchema,
+  reviewSubmissionSchema,
+  isHoneypotTriggered,
+} from './src/lib/validation';
 
-const __filename = fileURLToPath(import.meta.url);
-const __dirname = path.dirname(__filename);
+export const app = express();
+const PORT = Number(runtimePort) || 3000;
 
-const app = express();
-const PORT = 3000;
-
-app.use(express.json({ limit: '10mb' }));
-app.use(express.urlencoded({ extended: true, limit: '10mb' }));
-
-// 1. Helmet-style Security Headers & CSP
-app.use((req: Request, res: Response, next: NextFunction) => {
-  res.setHeader('X-Content-Type-Options', 'nosniff');
-  res.setHeader('Referrer-Policy', 'strict-origin-when-cross-origin');
-  
-  if (req.path.startsWith('/admin') || req.path.startsWith('/api/admin')) {
-    res.setHeader('X-Frame-Options', 'SAMEORIGIN');
-  } else {
-    res.setHeader(
-      'Content-Security-Policy',
-      "default-src 'self'; script-src 'self' 'unsafe-inline' 'unsafe-eval' https:; style-src 'self' 'unsafe-inline' https:; img-src 'self' data: blob: https:; font-src 'self' https: data:; frame-src 'self' https://www.youtube-nocookie.com https://www.youtube.com; connect-src 'self' https: wss:;"
-    );
+const rawBodyCapture = (req: Request, _res: Response, buf: Buffer) => {
+  if (buf && buf.length > 0) {
+    (req as Request & { rawBody?: string }).rawBody = buf.toString('utf8');
   }
-  next();
-});
-
-// Simple In-Memory Rate Limiter for Admin Routes
-const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
-const ADMIN_RATE_LIMIT_WINDOW_MS = 60 * 1000; // 1 minute
-const ADMIN_MAX_REQUESTS = 40; // 40 requests per minute
-
-const adminRateLimiter = (req: Request, res: Response, next: NextFunction) => {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  const record = rateLimitMap.get(ip);
-
-  if (!record || now > record.resetTime) {
-    rateLimitMap.set(ip, { count: 1, resetTime: now + ADMIN_RATE_LIMIT_WINDOW_MS });
-    return next();
-  }
-
-  if (record.count >= ADMIN_MAX_REQUESTS) {
-    return res.status(429).json({ error: 'Too many requests. Please wait a minute.' });
-  }
-
-  record.count += 1;
-  next();
 };
 
-// Admin Authentication via Supabase Auth + admins table check
-const SUPABASE_AUTH_COOKIE = 'enginity_sb_token';
+// Allow up to 10MB only on the authenticated admin image upload route; enforce 100kb on all other routes
+app.use('/api/admin/upload-image', express.json({ limit: '10mb', verify: rawBodyCapture }));
+app.use(express.json({ limit: '100kb', verify: rawBodyCapture }));
 
-async function verifyAdminUser(token: string): Promise<{ userId: string; email?: string } | null> {
-  if (!supabase) return null;
+app.use((err: any, _req: Request, res: Response, next: NextFunction) => {
+  if (err?.type === 'entity.too.large' || err?.status === 413) {
+    res.status(413).json({ error: 'Payload too large' });
+    return;
+  }
+  if (err instanceof SyntaxError && 'body' in err) {
+    res.status(400).json({ error: 'Invalid JSON payload' });
+    return;
+  }
+  next(err);
+});
+
+// ==========================================
+// Environment & Supabase Helpers
+// ==========================================
+let verifiedServiceKeyStatus: { key: string; valid: boolean } | null = null;
+let cachedAdminSession: { token: string; expiresAt: number } | null = null;
+
+function getSupabaseConfig() {
+  const supabaseUrl =
+    process.env.VITE_SUPABASE_URL ||
+    process.env.SUPABASE_URL ||
+    process.env.NEXT_PUBLIC_SUPABASE_URL ||
+    '';
+  const supabaseAnonKey =
+    process.env.VITE_SUPABASE_ANON_KEY ||
+    process.env.SUPABASE_ANON_KEY ||
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY ||
+    '';
+  const rawServiceKey = (process.env.SUPABASE_SERVICE_ROLE_KEY || '').trim();
+  const supabaseServiceKey =
+    rawServiceKey.startsWith('eyJ') &&
+    rawServiceKey.length > 100 &&
+    rawServiceKey.length < 300 &&
+    rawServiceKey !== supabaseAnonKey
+      ? rawServiceKey
+      : '';
+  return { supabaseUrl, supabaseAnonKey, supabaseServiceKey };
+}
+
+function getAnonSupabaseClient(): SupabaseClient | null {
+  const { supabaseUrl, supabaseAnonKey } = getSupabaseConfig();
+  if (!supabaseUrl || !supabaseAnonKey) return null;
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+function getRequestSupabaseClient(req: Request): SupabaseClient | null {
+  const { supabaseUrl, supabaseAnonKey } = getSupabaseConfig();
+  if (!supabaseUrl || !supabaseAnonKey) return null;
+
+  const authHeader = req.headers.authorization;
+  return createClient(supabaseUrl, supabaseAnonKey, {
+    global: authHeader ? { headers: { Authorization: authHeader } } : undefined,
+    auth: { persistSession: false, autoRefreshToken: false },
+  });
+}
+
+async function getAdminWriteSupabaseClient(req?: Request): Promise<SupabaseClient | null> {
+  const { supabaseUrl, supabaseAnonKey, supabaseServiceKey } = getSupabaseConfig();
+  if (!supabaseUrl || !supabaseAnonKey) return null;
+
+  if (supabaseServiceKey) {
+    if (!verifiedServiceKeyStatus || verifiedServiceKeyStatus.key !== supabaseServiceKey) {
+      const candidate = createClient(supabaseUrl, supabaseServiceKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+      const { error } = await candidate.from('settings').select('id').limit(1);
+      verifiedServiceKeyStatus = { key: supabaseServiceKey, valid: !error };
+      if (!error) return candidate;
+    } else if (verifiedServiceKeyStatus.valid) {
+      return createClient(supabaseUrl, supabaseServiceKey, {
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+    }
+  }
+
+  if (req?.headers.authorization) {
+    return getRequestSupabaseClient(req);
+  }
+
+  const adminEmail = process.env.ADMIN_EMAIL;
+  const adminPassword = process.env.ADMIN_PASSWORD;
+  if (adminEmail && adminPassword) {
+    const now = Date.now();
+    if (cachedAdminSession && cachedAdminSession.expiresAt > now + 30_000) {
+      return createClient(supabaseUrl, supabaseAnonKey, {
+        global: {
+          headers: { Authorization: `Bearer ${cachedAdminSession.token}` },
+        },
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+    }
+
+    const temp = createClient(supabaseUrl, supabaseAnonKey, {
+      auth: { persistSession: false, autoRefreshToken: false },
+    });
+    const { data, error } = await temp.auth.signInWithPassword({
+      email: adminEmail,
+      password: adminPassword,
+    });
+    if (!error && data?.session?.access_token) {
+      cachedAdminSession = {
+        token: data.session.access_token,
+        expiresAt: data.session.expires_at
+          ? data.session.expires_at * 1000
+          : now + 50 * 60 * 1000,
+      };
+      return createClient(supabaseUrl, supabaseAnonKey, {
+        global: {
+          headers: { Authorization: `Bearer ${data.session.access_token}` },
+        },
+        auth: { persistSession: false, autoRefreshToken: false },
+      });
+    }
+  }
+
+  return getAnonSupabaseClient();
+}
+
+// ==========================================
+// Rate Limiters
+// ==========================================
+const rateLimitMap = new Map<string, { count: number; resetTime: number }>();
+const recentWaitlistServerMap = new Map<string, number>();
+const recentCustomReqServerMap = new Map<string, number>();
+const recentSuggestionServerMap = new Map<string, number>();
+
+export function resetRateLimitsForTesting(): void {
+  rateLimitMap.clear();
+  recentWaitlistServerMap.clear();
+  recentCustomReqServerMap.clear();
+  recentSuggestionServerMap.clear();
+}
+
+function checkRateLimit(ip: string, limit = 10, windowMs = 60_000): boolean {
+  const now = Date.now();
+  if (rateLimitMap.size > 5000) {
+    for (const [k, v] of rateLimitMap.entries()) {
+      if (now > v.resetTime) rateLimitMap.delete(k);
+    }
+  }
+  const record = rateLimitMap.get(ip);
+  if (!record || now > record.resetTime) {
+    rateLimitMap.set(ip, { count: 1, resetTime: now + windowMs });
+    return true;
+  }
+  if (record.count >= limit) {
+    return false;
+  }
+  record.count += 1;
+  return true;
+}
+
+function getClientIp(req: Request): string {
+  const vercelForwarded = req.headers['x-vercel-forwarded-for'];
+  if (typeof vercelForwarded === 'string' && vercelForwarded.trim()) {
+    return vercelForwarded.split(',')[0].trim();
+  }
+  const realIp = req.headers['x-real-ip'];
+  if (typeof realIp === 'string' && realIp.trim()) {
+    return realIp.trim();
+  }
+  const forwarded = req.headers['x-forwarded-for'];
+  if (typeof forwarded === 'string' && forwarded.trim()) {
+    const parts = forwarded
+      .split(',')
+      .map((p) => p.trim())
+      .filter(Boolean);
+    return parts[parts.length - 1] || parts[0] || 'unknown';
+  }
+  return req.ip || req.socket?.remoteAddress || 'unknown';
+}
+
+// ==========================================
+// Admin Authorization Middleware (TASK-005)
+// ==========================================
+export async function requireAdminAuth(
+  req: Request,
+  res: Response,
+  next: NextFunction
+): Promise<void> {
+  const authHeader = req.headers.authorization;
+  if (!authHeader || !authHeader.startsWith('Bearer ')) {
+    res.status(401).json({ error: 'Unauthorized: Missing Bearer token' });
+    return;
+  }
+
+  const token = authHeader.slice('Bearer '.length).trim();
+  if (!token) {
+    res.status(401).json({ error: 'Unauthorized: Empty Bearer token' });
+    return;
+  }
+
+  const client = getRequestSupabaseClient(req);
+  if (!client) {
+    res.status(503).json({ error: 'Supabase is not configured on the server' });
+    return;
+  }
 
   try {
-    const { data: userData, error: userError } = await supabase.auth.getUser(token);
-    if (userError || !userData?.user) return null;
+    const {
+      data: { user },
+      error: userError,
+    } = await client.auth.getUser(token);
 
-    const userId = userData.user.id;
-    const adminSb = getSupabaseAdmin(token);
-    if (!adminSb) return null;
+    if (userError || !user) {
+      res.status(401).json({ error: 'Unauthorized: Invalid or expired session token' });
+      return;
+    }
 
-    // Verify user exists in admins table
-    const { data: adminRow, error: adminError } = await adminSb
-      .from('admins')
-      .select('user_id')
-      .eq('user_id', userId)
-      .single();
+    const { data: isAdmin, error: rpcError } = await client.rpc('is_admin');
+    if (rpcError || !isAdmin) {
+      res.status(403).json({ error: 'Forbidden: User is not an authorized administrator' });
+      return;
+    }
 
-    if (adminError || !adminRow) return null;
-
-    return { userId, email: userData.user.email };
+    (req as Request & { adminUser?: { id: string; email?: string } }).adminUser = {
+      id: user.id,
+      email: user.email,
+    };
+    next();
   } catch (err: any) {
-    console.error('verifyAdminUser error:', err);
-    return null;
+    res.status(401).json({ error: 'Unauthorized: Failed to verify administrator session' });
   }
 }
 
-const requireAdmin = async (req: Request, res: Response, next: NextFunction) => {
-  let token: string | undefined;
+// ==========================================
+// 1. Health Check Endpoint (TASK-002)
+// ==========================================
+app.get('/api/health', (_req: Request, res: Response) => {
+  res.status(200).json({ status: 'ok', timestamp: new Date().toISOString() });
+});
 
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.split(' ')[1];
-  } else if (req.headers.cookie) {
-    const cookies = req.headers.cookie.split(';').map(c => c.trim());
-    const match = cookies.find(c => c.startsWith(`${SUPABASE_AUTH_COOKIE}=`));
-    if (match) {
-      token = match.split('=')[1];
+// ==========================================
+// 2. Order Checkout & XPay Webhook (TASK-003, TASK-V02)
+// ==========================================
+interface InMemoryOrderRecord {
+  id: string;
+  product_id: string;
+  customer_name: string;
+  customer_email: string;
+  customer_phone: string;
+  amount_egp: number;
+  currency: 'EGP';
+  status: 'pending' | 'paid' | 'failed' | 'refunded';
+  xpay_transaction_id: string | null;
+  fulfilled_at: string | null;
+  created_at: string;
+  product_snapshot?: {
+    slug: string;
+    name_ar: string;
+    name_en: string;
+    file_url?: string;
+  };
+}
+
+export const inMemoryOrders = new Map<string, InMemoryOrderRecord>();
+const processedTransactions = new Set<string>();
+const inFlightWebhookOrders = new Set<string>();
+
+export function resetOrdersForTesting(): void {
+  inMemoryOrders.clear();
+  processedTransactions.clear();
+  inFlightWebhookOrders.clear();
+}
+
+function isAllowedXPayUrl(urlString: string): boolean {
+  try {
+    const parsedUrl = new URL(urlString);
+    if (parsedUrl.protocol !== 'https:') return false;
+    const allowedHosts = (
+      process.env.XPAY_ALLOWED_HOSTS ||
+      'checkout.xpay.app,community.xpay.app,xpay.app,staging.xpay.app'
+    )
+      .split(',')
+      .map((h) => h.trim().toLowerCase())
+      .filter(Boolean);
+    return allowedHosts.includes(parsedUrl.hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+async function handleCreateOrder(req: Request, res: Response): Promise<void> {
+  try {
+    const ip = getClientIp(req);
+    if (!checkRateLimit(`orders:${ip}`, 10, 60_000)) {
+      res.status(429).json({ error: 'Too many checkout requests. Please try again in a minute.' });
+      return;
     }
-  }
 
-  if (!token) {
-    return res.status(401).json({ error: 'Unauthenticated admin session.' });
-  }
+    if (isHoneypotTriggered(req.body || {})) {
+      res.status(400).json({ error: 'Invalid checkout request.' });
+      return;
+    }
 
-  const admin = await verifyAdminUser(token);
-  if (!admin) {
-    return res.status(403).json({ error: 'Forbidden. Non-admin account.' });
-  }
+    const parsed = orderInitSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({
+        error: parsed.error.issues[0]?.message || 'Invalid checkout fields',
+        issues: parsed.error.issues,
+      });
+      return;
+    }
 
-  (req as any).adminUser = admin;
-  (req as any).adminToken = token;
-  next();
-};
+    const { product_id, customer_name, customer_email, customer_phone } = parsed.data;
 
-// 2. PUBLIC API ENDPOINTS
+    const sb = await getAdminWriteSupabaseClient();
+    let product: any = null;
 
-app.get('/api/categories', async (req: Request, res: Response) => {
-  try {
-    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    const categories = await fetchCategories();
-    res.json({ categories });
-  } catch {
-    res.status(500).json({ error: 'Failed to fetch categories.' });
-  }
-});
+    if (sb) {
+      const { data, error } = await sb
+        .from('products')
+        .select(
+          'id, slug, status, name_ar, name_en, price_egp, original_price_egp, sale_price_egp, xpay_url'
+        )
+        .eq('id', product_id)
+        .maybeSingle();
 
-app.get('/api/settings', async (req: Request, res: Response) => {
-  try {
-    res.setHeader('Cache-Control', 'public, max-age=60, s-maxage=300, stale-while-revalidate=600');
-    const settings = await fetchSettings();
-    res.json({ settings });
-  } catch {
-    res.status(500).json({ error: 'Failed to fetch settings.' });
-  }
-});
-
-app.get('/api/products', async (req: Request, res: Response) => {
-  try {
-    const categoryId = req.query.cat ? Number(req.query.cat) : undefined;
-    const searchQuery = req.query.q ? String(req.query.q) : undefined;
-
-    let includeDrafts = false;
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.split(' ')[1];
-      const admin = await verifyAdminUser(token);
-      if (admin && req.query.drafts === 'true') {
-        includeDrafts = true;
+      if (!error && data) {
+        product = data;
       }
     }
-
-    if (!includeDrafts) {
-      res.setHeader('Cache-Control', 'public, max-age=30, s-maxage=120, stale-while-revalidate=300');
-    }
-
-    const products = await fetchProducts({
-      publishedOnly: !includeDrafts,
-      categoryId,
-      searchQuery
-    });
-
-    res.json({ products });
-  } catch {
-    res.status(500).json({ error: 'Failed to fetch products.' });
-  }
-});
-
-app.get('/api/products/:slug', async (req: Request, res: Response) => {
-  try {
-    const slug = req.params.slug;
-    let includeDrafts = false;
-
-    const authHeader = req.headers.authorization;
-    if (authHeader && authHeader.startsWith('Bearer ')) {
-      const token = authHeader.split(' ')[1];
-      const admin = await verifyAdminUser(token);
-      if (admin) includeDrafts = true;
-    }
-
-    const product = await fetchProductBySlug(slug, !includeDrafts);
 
     if (!product) {
-      return res.status(404).json({ error: 'Product not found.' });
+      res.status(404).json({ error: 'Product not found' });
+      return;
     }
 
-    res.json({ product });
-  } catch {
-    res.status(500).json({ error: 'Failed to fetch product.' });
-  }
-});
-
-// Phone Number Normalization Helper (E.164 with Egypt +20 support)
-function normalizePhoneNumber(phone: string): string {
-  if (!phone) return '';
-  let cleaned = phone.replace(/[^\d+]/g, '');
-  if (cleaned.startsWith('00')) {
-    cleaned = '+' + cleaned.slice(2);
-  }
-  if (!cleaned.startsWith('+')) {
-    if (cleaned.startsWith('01') && cleaned.length === 11) {
-      cleaned = '+20' + cleaned.slice(1);
-    } else {
-      cleaned = '+' + cleaned;
-    }
-  }
-  return cleaned;
-}
-
-// 2B. WAITLIST PUBLIC REGISTRATION ENDPOINT
-const waitlistRegisterSchema = z.object({
-  productId: z.string().uuid(),
-  email: z.string().email().optional().or(z.literal('')),
-  whatsappNumber: z.string().optional().or(z.literal('')),
-  emailConsent: z.boolean().default(false),
-  whatsappConsent: z.boolean().default(false),
-  lang: z.enum(['ar', 'en']).default('ar')
-});
-
-app.post('/api/waitlist/register', async (req: Request, res: Response) => {
-  try {
-    const parsed = waitlistRegisterSchema.parse(req.body);
-    const { productId, emailConsent, whatsappConsent, lang } = parsed;
-
-    const email = parsed.email ? parsed.email.trim().toLowerCase() : '';
-    const rawWhatsapp = parsed.whatsappNumber ? parsed.whatsappNumber.trim() : '';
-    const normalizedWhatsapp = rawWhatsapp ? normalizePhoneNumber(rawWhatsapp) : '';
-
-    if (!emailConsent && !whatsappConsent) {
-      return res.status(400).json({
-        error: lang === 'ar' ? 'يرجى اختيار وسيلة تنبيه واحدة على الأقل والموافقة عليها.' : 'Please select at least one notification channel with explicit consent.'
+    if (product.status !== 'published') {
+      res.status(400).json({
+        error:
+          product.status === 'coming_soon'
+            ? 'This product is coming soon and cannot be purchased yet.'
+            : 'This product is not available for purchase.',
       });
+      return;
     }
 
-    if (emailConsent && !email) {
-      return res.status(400).json({
-        error: lang === 'ar' ? 'يرجى إدخال بريد إلكتروني صحيح لطلب التنبيه.' : 'Please enter a valid email address.'
-      });
+    // Server-side canonical price calculation (never trusts client price)
+    const pricing = getEffectiveProductPricing(product);
+    const canonicalAmountEgp = pricing.effectivePriceEgp;
+
+    if (!Number.isFinite(canonicalAmountEgp) || canonicalAmountEgp <= 0) {
+      res.status(400).json({ error: 'Invalid product catalog price configuration.' });
+      return;
     }
 
-    if (whatsappConsent && (!normalizedWhatsapp || normalizedWhatsapp.length < 8)) {
-      return res.status(400).json({
-        error: lang === 'ar' ? 'يرجى إدخال رقم واتساب صحيح مصحوباً بكود الدولة.' : 'Please enter a valid WhatsApp phone number with country code.'
-      });
+    if (!product.xpay_url || !isAllowedXPayUrl(product.xpay_url)) {
+      res.status(400).json({ error: 'Invalid or untrusted payment gateway URL.' });
+      return;
     }
 
-    const adminSb = await getSystemAdminSupabase();
-    if (!adminSb) {
-      return res.status(503).json({ error: 'Database service unavailable.' });
-    }
-
-    // Verify product exists, is coming_soon, and has waitlist_enabled = true
-    const { data: product, error: prodError } = await adminSb
-      .from('products')
-      .select('id, name_ar, name_en, status, waitlist_enabled')
-      .eq('id', productId)
-      .single();
-
-    if (prodError || !product) {
-      return res.status(404).json({ error: lang === 'ar' ? 'المنتج غير موجود.' : 'Product not found.' });
-    }
-
-    if (product.status !== 'coming_soon') {
-      return res.status(400).json({
-        error: lang === 'ar' ? 'هذا المنتج ليس في قائمة المنتجات القادمة قريباً.' : 'This product is not currently in Coming Soon status.'
-      });
-    }
-
-    if (product.waitlist_enabled === false) {
-      return res.status(400).json({
-        error: lang === 'ar' ? 'تسجيل قائمة الانتظار مغلق حالياً لهذا المنتج.' : 'Waitlist registration is currently disabled for this product.'
-      });
-    }
-
-    const consentTextAr = 'أوافق على استلام إشعار عند إطلاق وتوفر هذا المنتج للشراء عبر القنوات المحددة.';
-    const consentTextEn = 'I agree to receive a launch notification when this product becomes available via the selected channels.';
-
-    // Check for existing registration for idempotency
-    let existingQuery = adminSb.from('product_waitlist').select('id, email_consent, whatsapp_consent').eq('product_id', productId);
-    if (email) {
-      existingQuery = existingQuery.eq('email', email);
-    } else if (normalizedWhatsapp) {
-      existingQuery = existingQuery.eq('whatsapp_number', normalizedWhatsapp);
-    }
-
-    const { data: existingRows } = await existingQuery;
-
-    if (existingRows && existingRows.length > 0) {
-      const existingId = existingRows[0].id;
-      const { error: updateError } = await adminSb
-        .from('product_waitlist')
-        .update({
-          email: email || undefined,
-          whatsapp_number: normalizedWhatsapp || undefined,
-          email_consent: emailConsent || existingRows[0].email_consent,
-          whatsapp_consent: whatsappConsent || existingRows[0].whatsapp_consent,
-          consent_text_ar: consentTextAr,
-          consent_text_en: consentTextEn,
-          consent_timestamp: new Date().toISOString()
-        })
-        .eq('id', existingId);
-
-      if (updateError) {
-        return res.status(500).json({ error: 'Failed to update waitlist entry.' });
+    // Look up protected deliverable file_url if available (for fulfillment snapshot)
+    let deliverableUrl = '';
+    if (sb) {
+      const { data: deliv } = await sb
+        .from('product_deliverables')
+        .select('file_url')
+        .eq('product_id', product.id)
+        .maybeSingle();
+      if (deliv?.file_url) {
+        deliverableUrl = deliv.file_url;
       }
-
-      return res.json({
-        success: true,
-        alreadyRegistered: true,
-        message: lang === 'ar'
-          ? 'أنت مسجل بالفعل في قائمة الانتظار لهذا المنتج، وسنقوم بتنبيهك عبر البريد الإلكتروني والواتساب بمجرد الإطلاق المباشر 🚀'
-          : 'You are already registered on the waitlist for this product! We will notify you via Email and WhatsApp as soon as it launches 🚀',
-        registrationId: existingId
-      });
     }
 
-    // Insert new waitlist registration
-    const { data: newEntry, error: insertError } = await adminSb
-      .from('product_waitlist')
-      .insert({
-        product_id: productId,
-        email: email,
-        whatsapp_number: normalizedWhatsapp,
-        email_consent: emailConsent,
-        whatsapp_consent: whatsappConsent,
-        consent_text_ar: consentTextAr,
-        consent_text_en: consentTextEn,
-        consent_timestamp: new Date().toISOString(),
-        email_status: emailConsent ? 'pending' : 'withdrawn',
-        whatsapp_status: whatsappConsent ? 'pending' : 'withdrawn'
-      })
-      .select('id')
-      .single();
+    let orderId: string = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
 
-    if (insertError) {
-      console.error('Waitlist insert error:', insertError);
-      return res.status(500).json({ error: 'Failed to save waitlist registration.', details: insertError });
-    }
-
-    return res.json({
-      success: true,
-      alreadyRegistered: false,
-      message: lang === 'ar' ? 'تم تسجيل طلب التنبيه الخاص بك بنجاح! وسنقوم بتنبيهك عبر البريد الإلكتروني والواتساب بمجرد الإطلاق المباشر 🚀' : 'You will receive a notification as soon as this product launches!',
-      registrationId: newEntry?.id
-    });
-  } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Invalid payload parameters.', details: err.issues });
-    }
-    return res.status(500).json({ error: 'Server error processing waitlist registration.', details: err.message || err });
-  }
-});
-
-// 3. ADMIN AUTH & API ENDPOINTS (Rate limited, Zod validated)
-
-const loginSchema = z.object({
-  email: z.string().email(),
-  password: z.string().min(1)
-});
-
-app.post('/api/admin/login', adminRateLimiter, async (req: Request, res: Response) => {
-  try {
-    const { email, password } = loginSchema.parse(req.body);
-
-    if (!isSupabaseConfigured() || !supabase) {
-      return res.status(503).json({
-        error: 'Supabase credentials missing in environment.'
-      });
-    }
-
-    // Authenticate with Supabase Auth
-    const { data: authData, error: authError } = await supabase.auth.signInWithPassword({
-      email,
-      password
-    });
-
-    if (authError || !authData.session || !authData.user) {
-      return res.status(401).json({ error: 'Invalid email or password.' });
-    }
-
-    const userId = authData.user.id;
-    const adminSb = getSupabaseAdmin(authData.session.access_token);
-    if (!adminSb) {
-      return res.status(500).json({ error: 'Supabase admin client not initialized.' });
-    }
-
-    const { data: adminRow, error: adminError } = await adminSb
-      .from('admins')
-      .select('user_id')
-      .eq('user_id', userId)
-      .single();
-
-    if (adminError || !adminRow) {
-      console.error('Admin verification error:', adminError, 'adminRow:', adminRow, 'userId:', userId);
-      return res.status(403).json({ error: 'Access denied. Non-admin account.' });
-    }
-
-    res.cookie(SUPABASE_AUTH_COOKIE, authData.session.access_token, {
-      httpOnly: true,
-      secure: false,
-      sameSite: 'lax',
-      path: '/'
-    });
-
-    res.json({
-      success: true,
-      token: authData.session.access_token,
-      user: { id: userId, email: authData.user.email }
-    });
-  } catch (err: any) {
-    res.status(400).json({ error: 'Invalid request payload', details: err.message });
-  }
-});
-
-app.get('/api/admin/me', adminRateLimiter, async (req: Request, res: Response) => {
-  let token: string | undefined;
-  const authHeader = req.headers.authorization;
-  if (authHeader && authHeader.startsWith('Bearer ')) {
-    token = authHeader.split(' ')[1];
-  } else if (req.headers.cookie) {
-    const cookies = req.headers.cookie.split(';').map(c => c.trim());
-    const match = cookies.find(c => c.startsWith(`${SUPABASE_AUTH_COOKIE}=`));
-    if (match) {
-      token = match.split('=')[1];
-    }
-  }
-
-  if (!token) {
-    return res.status(401).json({ authenticated: false });
-  }
-
-  const admin = await verifyAdminUser(token);
-  if (!admin) {
-    return res.status(401).json({ authenticated: false });
-  }
-
-  res.json({ authenticated: true, user: admin });
-});
-
-app.post('/api/admin/logout', (req: Request, res: Response) => {
-  res.clearCookie(SUPABASE_AUTH_COOKIE, { path: '/' });
-  res.json({ success: true });
-});
-
-// Zod Validation Schema for Product Write
-const nullableString = z.string().nullable().optional().transform(v => {
-  if (v === undefined || v === null || typeof v !== 'string' || v.trim() === '') return null;
-  return v.trim();
-});
-
-const nullableDate = z.string().nullable().optional().transform(v => normalizeDateToIso(v));
-
-const productInputSchema = z.object({
-  id: z.string().optional(),
-  name_ar: z.string().min(1),
-  name_en: z.string().min(1),
-  slug: z.string().min(1),
-  status: z.enum(['draft', 'published', 'coming_soon', 'archived']),
-  category_id: z.coerce.number(),
-  price_egp: z.coerce.number().min(0),
-  original_price_egp: z.coerce.number().min(0).nullable().optional(),
-  sale_price_egp: z.coerce.number().min(0).nullable().optional(),
-  xpay_url: nullableString.refine(url => !url || validateXPayUrl(url), {
-    message: 'xpay_url must be a valid https URL (and match XPAY_ALLOWED_HOSTS if set).'
-  }),
-  short_ar: nullableString,
-  short_en: nullableString,
-  description_ar: nullableString,
-  description_en: nullableString,
-  cover_path: nullableString,
-  diagram_path: nullableString,
-  video_url: nullableString,
-  tools: z.array(z.string()).optional(),
-  level: z.enum(['beginner', 'intermediate', 'advanced']),
-  includes_ar: z.array(z.string()).optional(),
-  includes_en: z.array(z.string()).optional(),
-  requirements_ar: z.array(z.any()).optional(),
-  requirements_en: z.array(z.any()).optional(),
-  steps_ar: z.array(z.any()).optional(),
-  steps_en: z.array(z.any()).optional(),
-  faq: z.array(z.any()).optional(),
-  sort_order: z.coerce.number().optional(),
-  expected_launch_date: nullableDate,
-  launch_announcement: nullableString,
-  waitlist_enabled: z.boolean().optional(),
-  admin_notes: nullableString
-});
-
-app.post('/api/admin/products', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const validated = productInputSchema.parse(req.body);
-    if (!validated.id) {
-      delete (validated as any).id;
-    }
-    const token = (req as any).adminToken;
-    const created = await createProduct(validated, token);
-    if (!created) {
-      return res.status(500).json({ error: 'Failed to create product in database.' });
-    }
-    res.status(201).json({ product: created });
-  } catch (err: any) {
-    console.error('Error creating product:', err);
-    res.status(400).json({ error: 'Validation or creation failed', details: err.issues || err.errors || err.message });
-  }
-});
-
-app.put('/api/admin/products/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id;
-    const validated = productInputSchema.partial().parse(req.body);
-    const token = (req as any).adminToken;
-    const updated = await updateProduct(id, validated, token);
-    if (!updated) {
-      return res.status(404).json({ error: 'Product not found or update failed.' });
-    }
-    res.json({ product: updated });
-  } catch (err: any) {
-    console.error('Error updating product:', err);
-    res.status(400).json({ error: 'Validation or update failed', details: err.issues || err.errors || err.message });
-  }
-});
-
-app.delete('/api/admin/products/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id;
-    const token = (req as any).adminToken;
-    const ok = await deleteProduct(id, token);
-    if (!ok) {
-      return res.status(404).json({ error: 'Product not found or delete failed.' });
-    }
-    res.json({ success: true });
-  } catch {
-    res.status(500).json({ error: 'Delete failed.' });
-  }
-});
-
-app.post('/api/admin/categories', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const token = (req as any).adminToken;
-    const created = await createCategory(req.body, token);
-    res.status(201).json({ category: created });
-  } catch (err: any) {
-    res.status(400).json({ error: 'Create category failed', details: err.message });
-  }
-});
-
-app.put('/api/admin/categories/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const id = Number(req.params.id);
-    const token = (req as any).adminToken;
-    const updated = await updateCategory(id, req.body, token);
-    res.json({ category: updated });
-  } catch (err: any) {
-    res.status(400).json({ error: 'Update category failed', details: err.message });
-  }
-});
-
-app.delete('/api/admin/categories/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const id = Number(req.params.id);
-    const token = (req as any).adminToken;
-    const ok = await deleteCategory(id, token);
-    res.json({ success: ok });
-  } catch (err: any) {
-    res.status(500).json({ error: 'Delete category failed', details: err.message });
-  }
-});
-
-app.put('/api/admin/settings', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const token = (req as any).adminToken;
-    const updated = await updateStoreSettings(req.body, token);
-    res.json({ settings: updated });
-  } catch {
-    res.status(500).json({ error: 'Update settings failed.' });
-  }
-});
-
-// 4. ADMIN WAITLIST & LAUNCH NOTIFICATION ENDPOINTS
-
-async function sendEmailLaunchNotification(recipientEmail: string, product: any, appUrl: string): Promise<{ success: boolean; providerId?: string; error?: string }> {
-  const resendApiKey = process.env.RESEND_API_KEY;
-  if (resendApiKey) {
-    try {
-      const productUrl = `${appUrl}/ar/products/${product.slug}`;
-      const response = await fetch('https://api.resend.com/emails', {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${resendApiKey}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          from: process.env.RESEND_FROM_EMAIL || 'ENGINITY <notifications@enginity.store>',
-          to: [recipientEmail],
-          subject: `⚡ تم إطلاق المنتج: ${product.name_ar}`,
-          html: `
-            <div style="font-family: 'Cairo', sans-serif; direction: rtl; text-align: right; padding: 20px; background-color: #f8fafc; color: #0b1f3a;">
-              <h2 style="color: #2f6bff;">خبر سار! تم توفير منتج الأتمتة الذي انتظرته 🚀</h2>
-              <h3 style="font-size: 20px; color: #0b1f3a;">${product.name_ar}</h3>
-              <p style="font-size: 15px; color: #475569; line-height: 1.7;">${product.short_ar || ''}</p>
-              ${product.launch_announcement ? `<p style="padding: 12px; background: #e0e7ff; border-radius: 8px; color: #1e1b4b;"><strong>تنويه الإطلاق:</strong> ${product.launch_announcement}</p>` : ''}
-              <div style="margin-top: 24px;">
-                <a href="${productUrl}" style="background-color: #2f6bff; color: #ffffff; padding: 14px 28px; text-decoration: none; font-weight: bold; border-radius: 10px; display: inline-block;">احصل على الـ Workflow الآن ⚡</a>
-              </div>
-              <p style="font-size: 12px; color: #94a3b8; margin-top: 30px;">وصلتك هذه الرسالة لأنك طلبت التنبيه عند إطلاق هذا المنتج على متجر ENGINITY.</p>
-            </div>
-          `
-        })
-      });
-      const data: any = await response.json();
-      if (response.ok && data.id) {
-        return { success: true, providerId: data.id };
-      }
-      return { success: false, error: data.message || 'Resend dispatch failed' };
-    } catch (err: any) {
-      return { success: false, error: err.message || 'Resend error' };
-    }
-  }
-
-  return {
-    success: false,
-    error: 'Email provider credentials (RESEND_API_KEY) not configured in server environment.'
-  };
-}
-
-async function sendWhatsAppLaunchNotification(phone: string, product: any, appUrl: string): Promise<{ success: boolean; providerId?: string; error?: string }> {
-  const token = process.env.WHATSAPP_CLOUD_API_TOKEN;
-  const phoneNumberId = process.env.WHATSAPP_PHONE_NUMBER_ID;
-  const n8nWebhook = process.env.N8N_WHATSAPP_WEBHOOK_URL;
-
-  if (n8nWebhook) {
-    try {
-      const response = await fetch(n8nWebhook, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'product_launch',
-          recipient_phone: phone,
+    if (sb) {
+      const { data: insertedOrder, error: orderError } = await sb
+        .from('orders')
+        .insert({
           product_id: product.id,
-          product_name_ar: product.name_ar,
-          product_url: `${appUrl}/ar/products/${product.slug}`,
-          launch_announcement: product.launch_announcement || ''
+          customer_name,
+          customer_email,
+          customer_phone,
+          amount_egp: canonicalAmountEgp,
+          status: 'pending',
         })
-      });
-      if (response.ok) {
-        return { success: true, providerId: 'n8n_webhook_dispatched' };
-      }
-    } catch (err: any) {
-      console.error('N8N WhatsApp webhook dispatch failed:', err);
-    }
-  }
+        .select('id')
+        .maybeSingle();
 
-  if (token && phoneNumberId) {
-    try {
-      const response = await fetch(`https://graph.facebook.com/v18.0/${phoneNumberId}/messages`, {
-        method: 'POST',
-        headers: {
-          'Authorization': `Bearer ${token}`,
-          'Content-Type': 'application/json'
-        },
-        body: JSON.stringify({
-          messaging_product: 'whatsapp',
-          to: phone.replace('+', ''),
-          type: 'text',
-          text: {
-            body: `⚡ تم إطلاق المنتج الجديد: ${product.name_ar}\n\n${product.short_ar || ''}\n\nاحصل عليه الآن عبر الرابط:\n${appUrl}/ar/products/${product.slug}`
-          }
-        })
-      });
-      const data: any = await response.json();
-      if (response.ok && data.messages?.[0]?.id) {
-        return { success: true, providerId: data.messages[0].id };
+      if (!orderError && insertedOrder?.id) {
+        orderId = insertedOrder.id;
       }
-      return { success: false, error: data.error?.message || 'Meta Cloud API error' };
-    } catch (err: any) {
-      return { success: false, error: err.message || 'WhatsApp Cloud API error' };
     }
-  }
 
-  return {
-    success: false,
-    error: 'WhatsApp provider credentials (WHATSAPP_CLOUD_API_TOKEN / N8N_WHATSAPP_WEBHOOK_URL) not configured in server environment.'
-  };
+    // Always store in-memory state as well for fast webhook verification & fallback
+    inMemoryOrders.set(orderId, {
+      id: orderId,
+      product_id: product.id,
+      customer_name,
+      customer_email,
+      customer_phone,
+      amount_egp: canonicalAmountEgp,
+      currency: 'EGP',
+      status: 'pending',
+      xpay_transaction_id: null,
+      fulfilled_at: null,
+      created_at: nowIso,
+      product_snapshot: {
+        slug: product.slug,
+        name_ar: product.name_ar,
+        name_en: product.name_en,
+        file_url: deliverableUrl,
+      },
+    });
+
+    const checkoutUrl = new URL(product.xpay_url);
+    checkoutUrl.searchParams.set('order_id', orderId);
+    checkoutUrl.searchParams.set('customer_email', customer_email);
+    checkoutUrl.searchParams.set('customer_name', customer_name);
+    checkoutUrl.searchParams.set('customer_phone', customer_phone);
+    checkoutUrl.searchParams.set('amount_egp', String(canonicalAmountEgp));
+
+    res.status(200).json({
+      order_id: orderId,
+      amount_egp: canonicalAmountEgp,
+      currency: 'EGP',
+      redirect_url: checkoutUrl.toString(),
+    });
+  } catch (err: any) {
+    res.status(500).json({ error: 'Internal server error while creating order' });
+  }
 }
 
-// Admin API to fetch waitlist entries and statistics
-app.get('/api/admin/waitlist/:productId', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const productId = req.params.productId;
-    const adminSb = await getSystemAdminSupabase();
-    if (!adminSb) return res.status(503).json({ error: 'Database client uninitialized.' });
+app.post('/api/orders', handleCreateOrder);
+app.post('/api/checkout/init', handleCreateOrder);
 
-    const { data: entries, error } = await adminSb
-      .from('product_waitlist')
-      .select('*')
-      .eq('product_id', productId)
-      .order('created_at', { ascending: false });
+function verifyWebhookSignature(rawPayload: string, providedSignature: string, secret: string): boolean {
+  if (!providedSignature || !secret) return false;
+  const trimmed = providedSignature.trim();
+
+  // Support either direct shared secret match or HMAC-SHA256 hex digest
+  const hmacDigest = crypto.createHmac('sha256', secret).update(rawPayload).digest('hex');
+
+  const safeCompare = (a: string, b: string) => {
+    const bufA = Buffer.from(a);
+    const bufB = Buffer.from(b);
+    if (bufA.length !== bufB.length) return false;
+    return crypto.timingSafeEqual(bufA, bufB);
+  };
+
+  return safeCompare(trimmed, secret) || safeCompare(trimmed, hmacDigest);
+}
+
+app.post('/api/webhook/xpay', async (req: Request, res: Response) => {
+  try {
+    const webhookSecret = process.env.XPAY_WEBHOOK_SECRET || '';
+    const providedSignature =
+      (req.headers['x-xpay-signature'] as string) ||
+      (req.headers['x-webhook-secret'] as string) ||
+      '';
+
+    if (!webhookSecret) {
+      res.status(503).json({ error: 'Webhook verification secret is not configured' });
+      return;
+    }
+
+    const rawBody =
+      (req as Request & { rawBody?: string }).rawBody || JSON.stringify(req.body || {});
+    if (!verifyWebhookSignature(rawBody, providedSignature, webhookSecret)) {
+      res.status(401).json({ error: 'Unauthorized: Invalid webhook signature' });
+      return;
+    }
+
+    const {
+      order_id,
+      transaction_id,
+      status,
+      amount_egp,
+      total_amount,
+      currency = 'EGP',
+    } = req.body || {};
+
+    if (!order_id || !status) {
+      res.status(400).json({ error: 'Missing required fields: order_id and status' });
+      return;
+    }
+
+    const orderKey = String(order_id).trim();
+    const normalizedStatus = String(status).toUpperCase().trim();
+    if (!['PAID', 'SUCCESS', 'SUCCESSFUL'].includes(normalizedStatus)) {
+      res.status(200).json({ status: 'ignored', reason: `Unhandled payment status: ${status}` });
+      return;
+    }
+
+    if (String(currency).toUpperCase().trim() !== 'EGP') {
+      res.status(400).json({ error: 'Invalid settlement currency; expected EGP' });
+      return;
+    }
+
+    const txId = transaction_id ? String(transaction_id).trim() : '';
+    if (txId && processedTransactions.has(txId)) {
+      res.status(200).json({ status: 'already_processed', idempotent: true });
+      return;
+    }
+
+    if (inFlightWebhookOrders.has(orderKey)) {
+      res.status(200).json({ status: 'already_processed', idempotent: true });
+      return;
+    }
+
+    inFlightWebhookOrders.add(orderKey);
+    try {
+      const sb = await getAdminWriteSupabaseClient();
+      let orderRecord: InMemoryOrderRecord | null = inMemoryOrders.get(orderKey) || null;
+      let dbProduct: any = null;
+
+      if (sb) {
+        const { data: dbOrder } = await sb
+          .from('orders')
+          .select(
+            '*, products(id, slug, name_ar, name_en, price_egp, original_price_egp, sale_price_egp)'
+          )
+          .eq('id', orderKey)
+          .maybeSingle();
+
+        if (dbOrder) {
+          dbProduct = (dbOrder as any).products || null;
+          orderRecord = {
+            id: dbOrder.id,
+            product_id: dbOrder.product_id,
+            customer_name: dbOrder.customer_name,
+            customer_email: dbOrder.customer_email,
+            customer_phone: dbOrder.customer_phone,
+            amount_egp: Number(dbOrder.amount_egp),
+            currency: 'EGP',
+            status: dbOrder.status,
+            xpay_transaction_id: dbOrder.xpay_transaction_id || null,
+            fulfilled_at: dbOrder.fulfilled_at || null,
+            created_at: dbOrder.created_at,
+          };
+        }
+      }
+
+      if (!orderRecord) {
+        res.status(404).json({ error: 'Order not found' });
+        return;
+      }
+
+      // Idempotency guard: already paid/fulfilled
+      if (
+        orderRecord.status === 'paid' ||
+        (txId && orderRecord.xpay_transaction_id === txId)
+      ) {
+        res.status(200).json({ status: 'already_processed', idempotent: true });
+        return;
+      }
+
+      // Verify paid amount matches canonical order amount_egp
+      const reportedAmount =
+        amount_egp !== undefined
+          ? Number(amount_egp)
+          : total_amount !== undefined
+          ? Number(total_amount)
+          : orderRecord.amount_egp;
+
+      if (
+        !Number.isFinite(reportedAmount) ||
+        Math.abs(reportedAmount - orderRecord.amount_egp) > 0.01
+      ) {
+        res.status(400).json({
+          error: `Payment amount mismatch: expected ${orderRecord.amount_egp} EGP, received ${reportedAmount} EGP`,
+        });
+        return;
+      }
+
+      const fulfilledAt = new Date().toISOString();
+      orderRecord.status = 'paid';
+      orderRecord.xpay_transaction_id = txId || `xpay_${Date.now()}`;
+      orderRecord.fulfilled_at = fulfilledAt;
+      inMemoryOrders.set(orderRecord.id, orderRecord);
+      if (txId) {
+        processedTransactions.add(txId);
+      }
+
+      if (sb) {
+        await sb
+          .from('orders')
+          .update({
+            status: 'paid',
+            xpay_transaction_id: orderRecord.xpay_transaction_id,
+            fulfilled_at: fulfilledAt,
+            updated_at: fulfilledAt,
+          })
+          .eq('id', orderRecord.id)
+          .neq('status', 'paid');
+      }
+
+    // Fetch protected deliverable file_url via server client (TASK-001)
+    let fileUrl = orderRecord.product_snapshot?.file_url || '';
+    let productNameAr = orderRecord.product_snapshot?.name_ar || dbProduct?.name_ar || '';
+    let productNameEn = orderRecord.product_snapshot?.name_en || dbProduct?.name_en || '';
+
+    if (sb && !fileUrl) {
+      const { data: deliv } = await sb
+        .from('product_deliverables')
+        .select('file_url')
+        .eq('product_id', orderRecord.product_id)
+        .maybeSingle();
+      if (deliv?.file_url) {
+        fileUrl = deliv.file_url;
+      }
+    }
+
+    if (sb && (!productNameAr || !productNameEn)) {
+      const { data: prod } = await sb
+        .from('products')
+        .select('name_ar, name_en')
+        .eq('id', orderRecord.product_id)
+        .maybeSingle();
+      if (prod) {
+        productNameAr = prod.name_ar || productNameAr;
+        productNameEn = prod.name_en || productNameEn;
+      }
+    }
+
+    // Trigger n8n fulfillment webhook if configured (TASK-V02)
+    const n8nWebhookUrl = process.env.N8N_FULFILLMENT_WEBHOOK_URL;
+    let fulfillmentDispatched = false;
+    if (n8nWebhookUrl) {
+      try {
+        const controller = new AbortController();
+        const timeout = setTimeout(() => controller.abort(), 10_000);
+        const n8nRes = await fetch(n8nWebhookUrl, {
+          method: 'POST',
+          headers: {
+            'Content-Type': 'application/json',
+            'x-Internal-Secret': process.env.N8N_WEBHOOK_SECRET || '',
+          },
+          body: JSON.stringify({
+            order_id: orderRecord.id,
+            customer_name: orderRecord.customer_name,
+            customer_email: orderRecord.customer_email,
+            customer_phone: orderRecord.customer_phone,
+            product_name_ar: productNameAr,
+            product_name_en: productNameEn,
+            file_url: fileUrl,
+            amount_egp: orderRecord.amount_egp,
+            currency: 'EGP',
+            transaction_id: orderRecord.xpay_transaction_id,
+          }),
+          signal: controller.signal,
+        });
+        clearTimeout(timeout);
+        fulfillmentDispatched = n8nRes.ok;
+      } catch {
+        fulfillmentDispatched = false;
+      }
+    }
+
+      res.status(200).json({
+        status: 'success',
+        idempotent: false,
+        order_id: orderRecord.id,
+        fulfillment_dispatched: fulfillmentDispatched,
+      });
+    } finally {
+      inFlightWebhookOrders.delete(orderKey);
+    }
+  } catch {
+    res.status(500).json({ error: 'Internal server error processing webhook' });
+  }
+});
+
+// ==========================================
+// 3. AI Shopping Assistant Proxy (TASK-008)
+// ==========================================
+const DEFAULT_N8N_ASSISTANT_WEBHOOK_URL =
+  'https://n8n-enginity.duckdns.org/webhook/agent-enginity-store';
+
+function extractAssistantReply(payload: unknown): string | null {
+  if (typeof payload === 'string') {
+    const trimmed = payload.trim();
+    if (!trimmed) return null;
+    if (
+      (trimmed.startsWith('{') && trimmed.endsWith('}')) ||
+      (trimmed.startsWith('[') && trimmed.endsWith(']'))
+    ) {
+      try {
+        const parsed = JSON.parse(trimmed);
+        return extractAssistantReply(parsed) || trimmed;
+      } catch {
+        return trimmed;
+      }
+    }
+    return trimmed;
+  }
+
+  if (Array.isArray(payload)) {
+    for (const item of payload) {
+      const extracted = extractAssistantReply(item);
+      if (extracted) return extracted;
+    }
+    return null;
+  }
+
+  if (payload && typeof payload === 'object') {
+    const record = payload as Record<string, unknown>;
+    const candidateKeys = [
+      'output',
+      'reply',
+      'response',
+      'message',
+      'text',
+      'answer',
+      'content',
+      'result',
+      'data',
+    ];
+    for (const key of candidateKeys) {
+      if (key in record) {
+        const extracted = extractAssistantReply(record[key]);
+        if (extracted) return extracted;
+      }
+    }
+  }
+
+  return null;
+}
+
+app.post('/api/assistant/chat', async (req: Request, res: Response) => {
+  try {
+    const ip = getClientIp(req);
+    // TASK-008: Strict IP rate limit of max 15 messages per 5 minutes (300_000 ms)
+    if (!checkRateLimit(`assistant:${ip}`, 15, 5 * 60 * 1000)) {
+      res.status(429).json({
+        error:
+          'لقد تجاوزت الحد المسموح للرسائل (15 رسالة كل 5 دقائق). يرجى الانتظار قليلاً ثم المحاولة مرة أخرى. / Rate limit exceeded (max 15 messages per 5 minutes).',
+      });
+      return;
+    }
+
+    const { message, sessionId, language, pathname, pageUrl } = req.body || {};
+
+    if (!message || typeof message !== 'string' || !message.trim()) {
+      res.status(400).json({ error: 'Message is required' });
+      return;
+    }
+
+    const cleanMessage = message.trim();
+    if (cleanMessage.length > 500) {
+      res.status(400).json({
+        error:
+          language === 'ar'
+            ? 'الرسالة طويلة جداً (الحد الأقصى 500 حرف).'
+            : 'Message exceeds maximum length of 500 characters.',
+      });
+      return;
+    }
+
+    const webhookUrl =
+      process.env.N8N_ASSISTANT_WEBHOOK_URL || DEFAULT_N8N_ASSISTANT_WEBHOOK_URL;
+
+    // TASK-008: 10-second AbortController timeout on upstream n8n fetch
+    const controller = new AbortController();
+    const timeoutId = setTimeout(() => controller.abort(), 10_000);
+
+    let webhookRes: globalThis.Response;
+    try {
+      webhookRes = await fetch(webhookUrl, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          Accept: 'application/json, text/plain, */*',
+        },
+        body: JSON.stringify({
+          message: cleanMessage,
+          chatInput: cleanMessage,
+          query: cleanMessage,
+          sessionId: typeof sessionId === 'string' && sessionId ? sessionId : 'anonymous',
+          language: language === 'en' ? 'en' : 'ar',
+          pathname: typeof pathname === 'string' ? pathname : '/',
+          pageUrl: typeof pageUrl === 'string' ? pageUrl : '',
+          source: 'enginity-store-web',
+          timestamp: new Date().toISOString(),
+        }),
+        signal: controller.signal,
+      });
+    } finally {
+      clearTimeout(timeoutId);
+    }
+
+    const rawText = await webhookRes.text();
+    if (!webhookRes.ok) {
+      res.status(502).json({
+        error:
+          language === 'ar'
+            ? 'تعذر الوصول إلى المساعد الذكي حالياً. يرجى المحاولة مرة أخرى.'
+            : 'Assistant service is temporarily unavailable.',
+      });
+      return;
+    }
+
+    const reply = extractAssistantReply(rawText);
+    if (!reply) {
+      res.status(502).json({
+        error:
+          language === 'ar'
+            ? 'لم يتم استلام رد صالح من المساعد الذكي.'
+            : 'Assistant returned an empty response.',
+      });
+      return;
+    }
+
+    res.status(200).json({ reply });
+  } catch (error: any) {
+    const isAbort = error?.name === 'AbortError';
+    res.status(isAbort ? 504 : 500).json({
+      error: isAbort
+        ? 'Assistant request timed out after 10 seconds.'
+        : 'Failed to communicate with AI Assistant',
+    });
+  }
+});
+
+// ==========================================
+// 4. Public Relational CRM Endpoints (TASK-006, TASK-007)
+// ==========================================
+app.post('/api/waitlist', async (req: Request, res: Response) => {
+  try {
+    const ip = getClientIp(req);
+    if (!checkRateLimit(`waitlist:${ip}`, 10, 60_000)) {
+      res.status(429).json({ error: 'Too many requests. Please wait a moment.' });
+      return;
+    }
+
+    if (isHoneypotTriggered(req.body || {})) {
+      res.status(200).json({ success: true, alreadyRegistered: false });
+      return;
+    }
+
+    const parsed = waitlistSubmissionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid waitlist input' });
+      return;
+    }
+
+    const sb = await getAdminWriteSupabaseClient();
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+
+    const { product_id, email, whatsapp_number, email_consent, whatsapp_consent } = parsed.data;
+    const dedupeKey = `${product_id}::${email || whatsapp_number}`;
+    const lastTs = recentWaitlistServerMap.get(dedupeKey) || 0;
+    if (Date.now() - lastTs < 300_000) {
+      res.status(200).json({ success: true, alreadyRegistered: true });
+      return;
+    }
+
+    // Verify product exists and is eligible for waitlist (coming_soon + waitlist_enabled)
+    const { data: prod } = await sb
+      .from('products')
+      .select('id, status, waitlist_enabled')
+      .eq('id', product_id)
+      .maybeSingle();
+
+    if (prod && (prod.status !== 'coming_soon' || prod.waitlist_enabled === false)) {
+      res.status(400).json({
+        error: 'Waitlist is only available for upcoming products with waitlist enabled.',
+      });
+      return;
+    }
+
+    // Check duplicate email for the same product
+    if (email) {
+      const { data: existing } = await sb
+        .from('product_waitlist')
+        .select('id')
+        .eq('product_id', product_id)
+        .ilike('email', email)
+        .maybeSingle();
+
+      if (existing) {
+        recentWaitlistServerMap.set(dedupeKey, Date.now());
+        res.status(200).json({ success: true, alreadyRegistered: true });
+        return;
+      }
+    }
+
+    const { error } = await sb.from('product_waitlist').insert({
+      product_id,
+      email: email || '',
+      whatsapp_number: whatsapp_number || '',
+      email_consent: email ? (email_consent ?? true) : false,
+      whatsapp_consent: whatsapp_number ? (whatsapp_consent ?? true) : false,
+      consent_text_ar: 'موافقة صريحة على استلام إشعار إطلاق المنتج',
+      consent_text_en: 'Explicit consent to receive product launch notification',
+    });
 
     if (error) {
-      return res.status(500).json({ error: 'Failed to fetch waitlist records.' });
+      if (error.code === '23505' || error.message?.toLowerCase().includes('duplicate')) {
+        recentWaitlistServerMap.set(dedupeKey, Date.now());
+        res.status(200).json({ success: true, alreadyRegistered: true });
+        return;
+      }
+      res.status(500).json({ error: error.message });
+      return;
     }
 
-    const rows = entries || [];
-    const stats = {
-      total_subscribers: rows.length,
-      email_count: rows.filter(r => r.email_consent && r.email).length,
-      whatsapp_count: rows.filter(r => r.whatsapp_consent && r.whatsapp_number).length,
-      pending_count: rows.filter(r => r.email_status === 'pending' || r.whatsapp_status === 'pending').length,
-      sent_count: rows.filter(r => r.email_status === 'sent' || r.whatsapp_status === 'sent').length,
-      failed_count: rows.filter(r => r.email_status === 'failed' || r.whatsapp_status === 'failed').length
+    recentWaitlistServerMap.set(dedupeKey, Date.now());
+    res.status(200).json({ success: true, alreadyRegistered: false });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to join waitlist' });
+  }
+});
+
+app.post('/api/custom-requests', async (req: Request, res: Response) => {
+  try {
+    const ip = getClientIp(req);
+    if (!checkRateLimit(`custom-req:${ip}`, 10, 60_000)) {
+      res.status(429).json({ error: 'Too many requests. Please try again shortly.' });
+      return;
+    }
+
+    if (isHoneypotTriggered(req.body || {})) {
+      res.status(200).json({ success: true });
+      return;
+    }
+
+    const parsed = customRequestSubmissionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid request input' });
+      return;
+    }
+
+    const sb = await getAdminWriteSupabaseClient();
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+
+    const d = parsed.data;
+    const resolvedName = (d.full_name || d.name || '').trim();
+    const resolvedType = (d.business_type || d.industry || d.brand_name || 'General Business').trim();
+    const resolvedProblem = (
+      d.business_problem ||
+      d.pain_points ||
+      d.business_description ||
+      d.automation_goal ||
+      d.desired_outcome ||
+      ''
+    ).trim();
+    const resolvedOutcome = (
+      d.desired_outcome ||
+      d.automation_goal ||
+      resolvedProblem
+    ).trim();
+    const resolvedTools =
+      Array.isArray(d.current_tools) && d.current_tools.length > 0
+        ? d.current_tools
+        : Array.isArray(d.platforms_involved)
+        ? d.platforms_involved
+        : [];
+
+    const dedupeKey = `${d.email}::${resolvedProblem.toLowerCase()}::${resolvedOutcome.toLowerCase()}`;
+    const lastTs = recentCustomReqServerMap.get(dedupeKey) || 0;
+    if (Date.now() - lastTs < 60_000) {
+      res.status(200).json({ success: true, duplicate: true });
+      return;
+    }
+
+    const insertPayload = {
+      name: resolvedName,
+      email: d.email,
+      whatsapp_number: d.whatsapp_number || '',
+      business_type: resolvedType,
+      business_problem: resolvedProblem,
+      desired_outcome: resolvedOutcome,
+      current_tools: resolvedTools,
+      expected_features: d.expected_features || d.current_workflow || '',
+      budget_range: d.budget_range || '',
+      delivery_timeframe: d.delivery_timeframe || d.timeline_urgency || '',
+      additional_notes: d.additional_notes || '',
+      marketing_consent: d.marketing_consent ?? true,
+      status: 'new',
     };
 
-    res.json({ entries: rows, stats });
-  } catch (err: any) {
-    res.status(500).json({ error: 'Failed to fetch waitlist stats.' });
-  }
-});
+    const { data, error } = await sb
+      .from('custom_automation_requests')
+      .insert(insertPayload)
+      .select('*')
+      .maybeSingle();
 
-// Admin API to Publish product and dispatch launch notifications idempotently
-app.post('/api/admin/products/:productId/launch', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const productId = req.params.productId;
-    const adminSb = await getSystemAdminSupabase();
-    if (!adminSb) return res.status(503).json({ error: 'Database client uninitialized.' });
-
-    const originUrl = `${req.protocol}://${req.get('host')}`;
-    const result = await processProductLaunch(adminSb, productId, originUrl);
-
-    if (!result.success) {
-      return res.status(400).json(result);
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
     }
 
-    res.json(result);
+    recentCustomReqServerMap.set(dedupeKey, Date.now());
+    res.status(200).json({ success: true, duplicate: false, item: data });
   } catch (err: any) {
-    res.status(500).json({ error: 'Launch processing failed', details: err.message });
+    res.status(500).json({ error: err?.message || 'Failed to submit custom request' });
   }
 });
 
-// Serve public uploads directory
-const publicUploadsDirectory = path.join(__dirname, 'public/uploads');
-if (!fs.existsSync(publicUploadsDirectory)) {
-  fs.mkdirSync(publicUploadsDirectory, { recursive: true });
-}
-app.use('/public/uploads', express.static(publicUploadsDirectory));
-app.use('/uploads', express.static(publicUploadsDirectory));
+app.post('/api/product-suggestions', async (req: Request, res: Response) => {
+  try {
+    const ip = getClientIp(req);
+    if (!checkRateLimit(`suggestion:${ip}`, 10, 60_000)) {
+      res.status(429).json({ error: 'Too many requests. Please try again shortly.' });
+      return;
+    }
 
-// Image upload via ImgBB with Supabase Storage & Local Fallbacks
-import multer from 'multer';
-const upload = multer({
-  storage: multer.memoryStorage(),
-  limits: { fileSize: 5 * 1024 * 1024 } // 5 MB max
+    if (isHoneypotTriggered(req.body || {})) {
+      res.status(200).json({ success: true, duplicate: false });
+      return;
+    }
+
+    const parsed = productSuggestionSubmissionSchema.safeParse(req.body || {});
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid suggestion input' });
+      return;
+    }
+
+    const sb = await getAdminWriteSupabaseClient();
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+
+    const { website_url: _hp, ...insertPayload } = parsed.data;
+    const fingerprint = `${insertPayload.proposed_name.toLowerCase()}::${insertPayload.problem_solved
+      .slice(0, 80)
+      .toLowerCase()}`;
+
+    const contactKey = (insertPayload.email || insertPayload.whatsapp_number || ip).toLowerCase();
+    const dedupeKey = `${contactKey}::${fingerprint}`;
+    const lastTs = recentSuggestionServerMap.get(dedupeKey) || 0;
+    if (Date.now() - lastTs < 60_000) {
+      res.status(200).json({ success: true, duplicate: true });
+      return;
+    }
+
+    const { data, error } = await sb
+      .from('product_suggestions')
+      .insert({
+        ...insertPayload,
+        fingerprint_hash: fingerprint,
+        status: 'under_review',
+      })
+      .select('*')
+      .maybeSingle();
+
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    recentSuggestionServerMap.set(dedupeKey, Date.now());
+    res.status(200).json({ success: true, duplicate: false, item: data });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to submit suggestion' });
+  }
 });
 
-function isValidImageMagicBytes(buffer: Buffer): boolean {
-  if (!buffer || buffer.length < 12) return false;
-  // JPEG: FF D8 FF
-  if (buffer[0] === 0xff && buffer[1] === 0xd8 && buffer[2] === 0xff) return true;
-  // PNG: 89 50 4E 47
-  if (buffer[0] === 0x89 && buffer[1] === 0x50 && buffer[2] === 0x4e && buffer[3] === 0x47) return true;
-  // WEBP: RIFF....WEBP
-  if (
-    buffer.slice(0, 4).toString('ascii') === 'RIFF' &&
-    buffer.slice(8, 12).toString('ascii') === 'WEBP'
-  ) return true;
+app.get('/api/reviews', async (req: Request, res: Response) => {
+  try {
+    const productId = typeof req.query.productId === 'string' ? req.query.productId.trim() : '';
+    const sb = await getAdminWriteSupabaseClient();
+    if (!sb) {
+      res.status(200).json({ items: [] });
+      return;
+    }
 
+    let query = sb
+      .from('product_reviews')
+      .select('id, product_id, customer_name, rating, review_text, status, created_at, updated_at')
+      .eq('status', 'approved')
+      .order('created_at', { ascending: false });
+
+    if (productId) {
+      query = query.eq('product_id', productId);
+    }
+
+    const { data, error } = await query;
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    res.status(200).json({ items: data || [] });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to fetch reviews' });
+  }
+});
+
+app.post('/api/reviews', async (req: Request, res: Response) => {
+  try {
+    const ip = getClientIp(req);
+    if (!checkRateLimit(`reviews:${ip}`, 8, 60_000)) {
+      res.status(429).json({ error: 'Too many review submissions. Please wait a minute.' });
+      return;
+    }
+
+    if (isHoneypotTriggered(req.body || {})) {
+      res.status(200).json({ success: true });
+      return;
+    }
+
+    const parsed = reviewSubmissionSchema.safeParse({
+      ...req.body,
+      rating: Number(req.body?.rating),
+    });
+
+    if (!parsed.success) {
+      res.status(400).json({ error: parsed.error.issues[0]?.message || 'Invalid review input' });
+      return;
+    }
+
+    const sb = await getAdminWriteSupabaseClient();
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+
+    const { product_id, customer_name, rating, review_text } = parsed.data;
+    const { data, error } = await sb
+      .from('product_reviews')
+      .insert({
+        product_id,
+        customer_name,
+        rating,
+        review_text,
+        status: 'pending',
+      })
+      .select('*')
+      .maybeSingle();
+
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    res.status(200).json({ success: true, item: data });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to submit review' });
+  }
+});
+
+// ==========================================
+// 5. Protected Admin API Routes (TASK-001, TASK-005)
+// ==========================================
+app.use('/api/admin', requireAdminAuth);
+
+const ALLOWED_UPLOAD_MIME_TYPES = new Set([
+  'image/png',
+  'image/jpeg',
+  'image/jpg',
+  'image/webp',
+  'image/gif',
+]);
+const ALLOWED_UPLOAD_EXTENSIONS = new Set(['.png', '.jpg', '.jpeg', '.webp', '.gif']);
+const MAX_UPLOAD_BYTES = 5 * 1024 * 1024; // 5 MB
+
+function hasValidImageMagicBytes(buf: Buffer): boolean {
+  if (buf.length < 4) return false;
+  // PNG: 89 50 4E 47 0D 0A 1A 0A
+  if (buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4e && buf[3] === 0x47) {
+    return true;
+  }
+  // JPEG: FF D8 FF
+  if (buf[0] === 0xff && buf[1] === 0xd8 && buf[2] === 0xff) {
+    return true;
+  }
+  // GIF: 47 49 46 38 ("GIF8")
+  if (buf[0] === 0x47 && buf[1] === 0x49 && buf[2] === 0x46 && buf[3] === 0x38) {
+    return true;
+  }
+  // WebP: "RIFF" .... "WEBP"
+  if (
+    buf.length >= 12 &&
+    buf[0] === 0x52 &&
+    buf[1] === 0x49 &&
+    buf[2] === 0x46 &&
+    buf[3] === 0x46 &&
+    buf[8] === 0x57 &&
+    buf[9] === 0x45 &&
+    buf[10] === 0x42 &&
+    buf[11] === 0x50
+  ) {
+    return true;
+  }
   return false;
 }
 
-app.post('/api/admin/upload-image', adminRateLimiter, requireAdmin, upload.single('image'), async (req: Request, res: Response) => {
+// Admin Image Upload Proxy — strictly uses process.env.IMGBB_API_KEY (TASK-005)
+app.post('/api/admin/upload-image', async (req: Request, res: Response) => {
   try {
-    const file = req.file;
-    if (!file || !file.buffer) {
-      return res.status(400).json({ error: 'لم يتم تحديد أي ملف صورة للرفع.' });
+    const { imageBase64, name } = req.body || {};
+    if (!imageBase64 || typeof imageBase64 !== 'string' || !imageBase64.trim()) {
+      res.status(400).json({ error: 'Missing imageBase64 payload' });
+      return;
     }
 
-    if (file.size > 5 * 1024 * 1024) {
-      return res.status(400).json({
-        error: 'حجم الصورة يتجاوز الحد المسموح به (5 ميجابايت). يرجى اختيار صورة أصغر.'
-      });
-    }
-
-    if (!isValidImageMagicBytes(file.buffer)) {
-      return res.status(400).json({
-        error: 'نوع الملف غير مدعوم. يرجى اختيار صورة بصيغة JPEG أو PNG أو WEBP فقط.'
-      });
-    }
-
-    const slug = (req.body?.slug || 'product').toString().replace(/[^a-z0-9_-]/gi, '');
-    const purpose = (req.body?.purpose || 'image').toString().replace(/[^a-z0-9_-]/gi, '');
-    const customName = `${slug}_${purpose}_${Date.now()}`;
-    const ext = file.mimetype.split('/')[1] || 'png';
-    const filename = `${customName}.${ext}`;
-
-    let directUrl: string | null = null;
-    let uploadSource = '';
-
-    // Strategy 1: ImgBB API
-    const apiKey = (process.env.IMGBB_API_KEY || 'e006ebcf750e5849df32660282d17a9e').trim();
-    if (apiKey) {
-      try {
-        const base64Image = file.buffer.toString('base64');
-        const formData = new URLSearchParams();
-        formData.append('image', base64Image);
-        formData.append('name', customName);
-
-        const controller = new AbortController();
-        const timeoutId = setTimeout(() => controller.abort(), 15000);
-
-        const imgbbRes = await fetch(`https://api.imgbb.com/1/upload?key=${apiKey}`, {
-          method: 'POST',
-          body: formData,
-          signal: controller.signal
+    // 1. Validate optional file name extension
+    if (name && typeof name === 'string') {
+      const extMatch = name.trim().toLowerCase().match(/(\.[a-z0-9]+)$/);
+      if (extMatch && !ALLOWED_UPLOAD_EXTENSIONS.has(extMatch[1])) {
+        res.status(400).json({
+          error: `Unsupported file extension "${extMatch[1]}". Allowed: .png, .jpg, .jpeg, .webp, .gif`,
         });
-        clearTimeout(timeoutId);
-
-        if (imgbbRes.ok) {
-          const json = await imgbbRes.json();
-          if (json && json.success && json.data && json.data.url) {
-            directUrl = json.data.url;
-            uploadSource = 'imgbb';
-          }
-        }
-      } catch (e) {
-        console.warn('ImgBB upload attempt failed, trying fallbacks:', e);
+        return;
       }
     }
 
-    // Strategy 2: Supabase Storage Bucket ('product-media' or 'public')
-    if (!directUrl && isSupabaseConfigured()) {
-      try {
-        const adminSb = getSupabaseAdmin() || supabase;
-        if (adminSb) {
-          const { data: uploadData, error: uploadErr } = await adminSb.storage
-            .from('product-media')
-            .upload(filename, file.buffer, {
-              contentType: file.mimetype,
-              upsert: true
-            });
-
-          if (!uploadErr && uploadData) {
-            const { data: publicUrlData } = adminSb.storage
-              .from('product-media')
-              .getPublicUrl(filename);
-
-            if (publicUrlData && publicUrlData.publicUrl) {
-              directUrl = publicUrlData.publicUrl;
-              uploadSource = 'supabase';
-            }
-          }
-        }
-      } catch (e) {
-        console.warn('Supabase storage upload failed, trying local fallback:', e);
+    // 2. Validate MIME type header if data URI prefix is provided
+    const dataUriMatch = imageBase64.trim().match(/^data:([^;]+);base64,([\s\S]+)$/i);
+    let cleanBase64 = imageBase64.trim();
+    if (dataUriMatch) {
+      const mimeType = dataUriMatch[1].trim().toLowerCase();
+      if (!ALLOWED_UPLOAD_MIME_TYPES.has(mimeType)) {
+        res.status(400).json({
+          error: `Unsupported image MIME type "${mimeType}". Allowed: image/png, image/jpeg, image/webp, image/gif`,
+        });
+        return;
       }
+      cleanBase64 = dataUriMatch[2].trim();
     }
 
-    // Strategy 3: Local Server Storage (/public/uploads/)
-    if (!directUrl) {
-      try {
-        const uploadsDir = path.join(__dirname, 'public/uploads');
-        if (!fs.existsSync(uploadsDir)) {
-          fs.mkdirSync(uploadsDir, { recursive: true });
-        }
-        fs.writeFileSync(path.join(uploadsDir, filename), file.buffer);
-
-        const protocol = req.headers['x-forwarded-proto'] || req.protocol || 'https';
-        const host = req.headers.host || 'localhost:3000';
-        directUrl = `${protocol}://${host}/uploads/${filename}`;
-        uploadSource = 'local';
-      } catch (e) {
-        console.error('Local file save failed:', e);
-      }
+    // 3. Validate base64 syntax, decoded byte size, and binary magic bytes
+    const normalizedB64 = cleanBase64.replace(/\s+/g, '');
+    if (!normalizedB64 || !/^[A-Za-z0-9+/]+={0,2}$/.test(normalizedB64)) {
+      res.status(400).json({ error: 'Invalid base64 encoding' });
+      return;
     }
 
-    if (!directUrl) {
-      return res.status(500).json({ error: 'تعذّر رفع أو حفظ الصورة. يرجى المحاولة لاحقاً.' });
+    const decodedBuffer = Buffer.from(normalizedB64, 'base64');
+    if (decodedBuffer.length === 0) {
+      res.status(400).json({ error: 'Decoded image payload is empty' });
+      return;
+    }
+    if (decodedBuffer.length > MAX_UPLOAD_BYTES) {
+      res.status(413).json({
+        error: `Image exceeds maximum allowed size of 5 MB (${decodedBuffer.length} bytes)`,
+      });
+      return;
+    }
+    if (!hasValidImageMagicBytes(decodedBuffer)) {
+      res.status(400).json({
+        error: 'Invalid image content: binary file header does not match PNG, JPEG, WebP, or GIF',
+      });
+      return;
     }
 
-    return res.json({
-      url: directUrl,
-      source: uploadSource
+    const imgbbKey = process.env.IMGBB_API_KEY;
+    if (!imgbbKey || !imgbbKey.trim()) {
+      res.status(503).json({ error: 'IMGBB_API_KEY is not configured on the server' });
+      return;
+    }
+
+    const formBody = new URLSearchParams();
+    formBody.append('key', imgbbKey.trim());
+    formBody.append('image', normalizedB64);
+    if (name && typeof name === 'string') {
+      formBody.append('name', name.replace(/\.[^/.]+$/, '').slice(0, 64));
+    }
+
+    const response = await fetch('https://api.imgbb.com/1/upload', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+      body: formBody.toString(),
+    });
+
+    const result: any = await response.json();
+    if (!response.ok || !result?.success || !result?.data?.url) {
+      res.status(502).json({
+        error: result?.error?.message || 'ImgBB upload failed',
+      });
+      return;
+    }
+
+    res.status(200).json({
+      url: result.data.display_url || result.data.url,
+      delete_url: result.data.delete_url,
     });
   } catch (err: any) {
-    return res.status(500).json({ error: err.message || 'تعذّر رفع الصورة، حاول مرة تانية.' });
+    res.status(500).json({ error: err?.message || 'Failed to upload image' });
   }
 });
 
-// 3B. EVOLUTION FEATURES: AI SHOPPING ASSISTANT, CUSTOM REQUESTS & PRODUCT SUGGESTIONS
+// Admin Products CRUD with Protected Deliverables (TASK-001, TASK-004)
+app.get('/api/admin/products', async (req: Request, res: Response) => {
+  try {
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
 
-const publicSubmissionRateMap = new Map<string, { count: number; resetTime: number }>();
-const PUBLIC_SUBMISSION_WINDOW_MS = 60 * 1000;
-const PUBLIC_SUBMISSION_MAX = 25;
+    const { data: products, error } = await sb
+      .from('products')
+      .select('*, category:categories(*)')
+      .order('sort_order', { ascending: true });
 
-const publicSubmissionRateLimiter = (req: Request, res: Response, next: NextFunction) => {
-  const ip = req.ip || req.socket.remoteAddress || 'unknown';
-  const now = Date.now();
-  const rec = publicSubmissionRateMap.get(ip);
-  if (!rec || now > rec.resetTime) {
-    publicSubmissionRateMap.set(ip, { count: 1, resetTime: now + PUBLIC_SUBMISSION_WINDOW_MS });
-    return next();
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+
+    const { data: deliverables } = await sb
+      .from('product_deliverables')
+      .select('product_id, file_url');
+
+    const delivMap = new Map<string, string>();
+    for (const d of deliverables || []) {
+      if (d?.product_id) {
+        delivMap.set(d.product_id, d.file_url || '');
+      }
+    }
+
+    const items = (products || []).map((p: any) => ({
+      ...p,
+      file_url: delivMap.get(p.id) ?? p.file_url ?? '',
+    }));
+
+    res.status(200).json({ items });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to load admin products' });
   }
-  if (rec.count >= PUBLIC_SUBMISSION_MAX) {
-    return res.status(429).json({
-      error: 'Too many requests. Please wait a minute before trying again.'
+});
+
+async function saveDeliverableUrl(sb: SupabaseClient, productId: string, fileUrl?: string) {
+  if (fileUrl === undefined) return;
+  try {
+    await sb.from('product_deliverables').upsert(
+      {
+        product_id: productId,
+        file_url: String(fileUrl || '').trim(),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: 'product_id' }
+    );
+  } catch {
+    // Ignore if table not yet migrated in remote DB
+  }
+}
+
+function normalizeIncomingProductPricing(payload: Record<string, any>) {
+  const copy: Record<string, any> = { ...payload };
+  delete copy.id;
+  delete copy.created_at;
+  delete copy.category;
+  delete copy.file_url;
+  delete copy.discount_percentage;
+
+  const rawOrig =
+    copy.original_price_egp !== undefined && copy.original_price_egp !== null
+      ? Number(copy.original_price_egp)
+      : Number(copy.price_egp);
+  const originalPriceEgp = Number.isFinite(rawOrig) && rawOrig >= 0 ? rawOrig : 0;
+
+  const rawSale =
+    copy.sale_price_egp !== undefined &&
+    copy.sale_price_egp !== null &&
+    String(copy.sale_price_egp).trim() !== ''
+      ? Number(copy.sale_price_egp)
+      : null;
+
+  if (rawSale !== null && Number.isFinite(rawSale) && rawSale > 0) {
+    if (rawSale >= originalPriceEgp) {
+      throw new Error('Discounted price must be strictly less than original price');
+    }
+    copy.original_price_egp = originalPriceEgp;
+    copy.sale_price_egp = rawSale;
+    copy.price_egp = rawSale;
+  } else {
+    copy.original_price_egp = originalPriceEgp;
+    copy.sale_price_egp = null;
+    copy.price_egp = originalPriceEgp;
+  }
+
+  return copy;
+}
+
+app.post('/api/admin/products', async (req: Request, res: Response) => {
+  try {
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+
+    const fileUrl = typeof req.body?.file_url === 'string' ? req.body.file_url.trim() : '';
+    const dbPayload = normalizeIncomingProductPricing(req.body || {});
+    dbPayload.updated_at = new Date().toISOString();
+
+    const { data, error } = await sb
+      .from('products')
+      .insert(dbPayload)
+      .select('*, category:categories(*)')
+      .maybeSingle();
+
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+
+    if (data?.id) {
+      await saveDeliverableUrl(sb, data.id, fileUrl);
+    }
+
+    res.status(200).json({ item: { ...data, file_url: fileUrl } });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Failed to create product' });
+  }
+});
+
+app.put('/api/admin/products/:id', async (req: Request, res: Response) => {
+  try {
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+
+    const productId = req.params.id;
+    const fileUrl =
+      typeof req.body?.file_url === 'string' ? req.body.file_url.trim() : undefined;
+    const dbPayload = normalizeIncomingProductPricing(req.body || {});
+    dbPayload.updated_at = new Date().toISOString();
+
+    const { data, error } = await sb
+      .from('products')
+      .update(dbPayload)
+      .eq('id', productId)
+      .select('*, category:categories(*)')
+      .maybeSingle();
+
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+
+    await saveDeliverableUrl(sb, productId, fileUrl);
+
+    res.status(200).json({
+      item: {
+        ...data,
+        file_url: fileUrl ?? '',
+      },
     });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Failed to update product' });
   }
-  rec.count += 1;
-  next();
-};
+});
 
-// Feature A: AI Shopping Assistant Chat Endpoint
-const assistantChatSchema = z.object({
-  message: z.string().min(1).max(1500),
-  history: z
-    .array(
-      z.object({
-        role: z.enum(['user', 'assistant']),
-        content: z.string().max(2000)
+app.delete('/api/admin/products/:id', async (req: Request, res: Response) => {
+  try {
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+
+    const productId = req.params.id;
+    const { error } = await sb.from('products').delete().eq('id', productId);
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+
+    res.status(200).json({ success: true });
+  } catch (err: any) {
+    res.status(400).json({ error: err?.message || 'Failed to delete product' });
+  }
+});
+
+// Admin CRM & Reviews Endpoints (TASK-005, TASK-006)
+app.get('/api/admin/custom-requests', async (req: Request, res: Response) => {
+  try {
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+    const { data, error } = await sb
+      .from('custom_automation_requests')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+    res.status(200).json({ items: data || [] });
+  } catch (err: any) {
+    res.status(500).json({ error: err?.message || 'Failed to fetch custom requests' });
+  }
+});
+
+app.put('/api/admin/custom-requests/:id', async (req: Request, res: Response) => {
+  try {
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+    const { status, admin_notes } = req.body || {};
+    const { data, error } = await sb
+      .from('custom_automation_requests')
+      .update({
+        ...(status ? { status } : {}),
+        ...(admin_notes !== undefined ? { admin_notes } : {}),
+        updated_at: new Date().toISOString(),
       })
-    )
-    .optional(),
-  lang: z.enum(['ar', 'en']).default('ar'),
-  conversationId: z.string().optional(),
-  sessionId: z.string().optional(),
-  page: z.string().optional(),
-  context: z.string().optional()
-});
+      .eq('id', req.params.id)
+      .select('*')
+      .maybeSingle();
 
-app.post('/api/assistant/chat', publicSubmissionRateLimiter, async (req: Request, res: Response) => {
-  try {
-    const parsed = assistantChatSchema.parse(req.body);
-    const response = await processAssistantTurn({
-      message: parsed.message,
-      history: parsed.history,
-      lang: parsed.lang,
-      conversationId: parsed.conversationId,
-      sessionId: parsed.sessionId,
-      page: parsed.page,
-      context: parsed.context
-    });
-    return res.json({ response });
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(200).json({ item: data });
   } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Invalid chat message payload.' });
-    }
-    console.error('POST /api/assistant/chat error:', err);
-    return res.status(500).json({ error: 'Assistant service temporarily unavailable.' });
+    res.status(400).json({ error: err?.message || 'Failed to update custom request' });
   }
 });
 
-// Feature B: Custom Automation Requests (Public Submission + Admin Management)
-const customRequestCreateSchema = z.object({
-  name: z.string().max(150).optional(),
-  email: z.string().email(),
-  whatsapp_number: z.string().max(40).optional(),
-  business_type: z.string().min(2).max(200),
-  business_problem: z.string().min(5).max(3000),
-  desired_outcome: z.string().min(3).max(3000),
-  current_tools: z.array(z.string().max(100)).optional(),
-  expected_features: z.string().max(2000).optional(),
-  budget_range: z.string().max(150).optional(),
-  delivery_timeframe: z.string().max(150).optional(),
-  additional_notes: z.string().max(2000).optional(),
-  marketing_consent: z.boolean(),
-  lang: z.enum(['ar', 'en']).optional()
-});
-
-app.post('/api/custom-requests', publicSubmissionRateLimiter, async (req: Request, res: Response) => {
+app.get('/api/admin/product-suggestions', async (req: Request, res: Response) => {
   try {
-    const parsed = customRequestCreateSchema.parse(req.body);
-    const result = await createCustomAutomationRequest(parsed);
-    if (!result.success) {
-      return res.status(400).json({ error: result.message });
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
     }
-    // Strip internal admin fields from public response
-    const publicSafeRequest = result.request
-      ? {
-          id: result.request.id,
-          status: result.request.status,
-          created_at: result.request.created_at
-        }
-      : undefined;
-    return res.status(result.duplicate ? 200 : 201).json({
-      success: true,
-      duplicate: result.duplicate,
-      message: result.message,
-      request: publicSafeRequest
-    });
+    const { data, error } = await sb
+      .from('product_suggestions')
+      .select('*')
+      .order('created_at', { ascending: false });
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+    res.status(200).json({ items: data || [] });
   } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: err.issues[0]?.message || 'Invalid form fields.' });
-    }
-    return res.status(500).json({ error: 'Failed to submit custom automation request.' });
+    res.status(500).json({ error: err?.message || 'Failed to fetch product suggestions' });
   }
 });
 
-app.get('/api/admin/custom-requests', adminRateLimiter, requireAdmin, async (_req: Request, res: Response) => {
+app.put('/api/admin/product-suggestions/:id', async (req: Request, res: Response) => {
   try {
-    const requests = await listCustomAutomationRequests();
-    return res.json({ requests });
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+    const { status, admin_notes, converted_product_id } = req.body || {};
+    const { data, error } = await sb
+      .from('product_suggestions')
+      .update({
+        ...(status ? { status } : {}),
+        ...(admin_notes !== undefined ? { admin_notes } : {}),
+        ...(converted_product_id !== undefined ? { converted_product_id } : {}),
+        updated_at: new Date().toISOString(),
+      })
+      .eq('id', req.params.id)
+      .select('*')
+      .maybeSingle();
+
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(200).json({ item: data });
   } catch (err: any) {
-    return res.status(500).json({ error: 'Failed to load custom automation requests.' });
+    res.status(400).json({ error: err?.message || 'Failed to update product suggestion' });
   }
 });
 
-const customRequestUpdateSchema = z.object({
-  status: z
-    .enum([
-      'new',
-      'reviewing',
-      'needs_clarification',
-      'quoted',
-      'accepted',
-      'rejected',
-      'completed'
-    ])
-    .optional(),
-  admin_notes: z.string().max(4000).optional(),
-  estimated_quote_egp: z.number().min(0).nullable().optional()
-});
-
-app.put('/api/admin/custom-requests/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
+app.get('/api/admin/reviews', async (req: Request, res: Response) => {
   try {
-    const id = req.params.id;
-    const parsed = customRequestUpdateSchema.parse(req.body);
-    const result = await updateCustomAutomationRequest(id, parsed);
-    if (!result.success) {
-      return res.status(404).json({ error: result.message || 'Request not found.' });
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
     }
-    return res.json({ success: true, request: result.request });
+    const { data, error } = await sb
+      .from('product_reviews')
+      .select('*, product:products(id, slug, name_ar, name_en, cover_path)')
+      .order('created_at', { ascending: false });
+    if (error) {
+      res.status(500).json({ error: error.message });
+      return;
+    }
+    res.status(200).json({ items: data || [] });
   } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Invalid update payload.' });
-    }
-    return res.status(500).json({ error: 'Failed to update custom request.' });
+    res.status(500).json({ error: err?.message || 'Failed to fetch admin reviews' });
   }
 });
 
-// Feature C: Customer Product Suggestions & Demand Analytics
-const productSuggestionCreateSchema = z.object({
-  proposed_name: z.string().min(2).max(200),
-  problem_solved: z.string().min(5).max(3000),
-  target_audience: z.string().min(2).max(300),
-  expected_features: z.string().max(2000).optional(),
-  platforms_integrations: z.array(z.string().max(100)).optional(),
-  email: z.string().email().optional().or(z.literal('')),
-  whatsapp_number: z.string().max(40).optional(),
-  purchase_likelihood: z.enum(['very_likely', 'likely', 'not_sure', 'unlikely']),
-  preferred_price_range: z.string().max(150).optional(),
-  additional_context: z.string().max(2000).optional(),
-  contact_consent: z.boolean(),
-  lang: z.enum(['ar', 'en']).optional()
-});
-
-app.post('/api/product-suggestions', publicSubmissionRateLimiter, async (req: Request, res: Response) => {
+app.put('/api/admin/reviews/:id', async (req: Request, res: Response) => {
   try {
-    const parsed = productSuggestionCreateSchema.parse(req.body);
-    const result = await createProductSuggestion(parsed);
-    if (!result.success) {
-      return res.status(400).json({ error: result.message });
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
     }
-    const publicSafeSuggestion = result.suggestion
-      ? {
-          id: result.suggestion.id,
-          proposed_name: result.suggestion.proposed_name,
-          status: result.suggestion.status,
-          created_at: result.suggestion.created_at
-        }
-      : undefined;
-    return res.status(result.duplicate ? 200 : 201).json({
-      success: true,
-      duplicate: result.duplicate,
-      message: result.message,
-      suggestion: publicSafeSuggestion
-    });
+    const { status } = req.body || {};
+    if (!['pending', 'approved', 'rejected'].includes(status)) {
+      res.status(400).json({ error: 'Invalid review status' });
+      return;
+    }
+    const { data, error } = await sb
+      .from('product_reviews')
+      .update({ status, updated_at: new Date().toISOString() })
+      .eq('id', req.params.id)
+      .select('*')
+      .maybeSingle();
+
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(200).json({ item: data });
   } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: err.issues[0]?.message || 'Invalid suggestion fields.' });
-    }
-    return res.status(500).json({ error: 'Failed to submit product suggestion.' });
+    res.status(400).json({ error: err?.message || 'Failed to update review status' });
   }
 });
 
-app.get('/api/admin/product-suggestions', adminRateLimiter, requireAdmin, async (_req: Request, res: Response) => {
+app.delete('/api/admin/reviews/:id', async (req: Request, res: Response) => {
   try {
-    const suggestions = await listProductSuggestions();
-    const analytics = computeDemandAnalytics(suggestions);
-    return res.json({ suggestions, analytics });
+    const sb = await getAdminWriteSupabaseClient(req);
+    if (!sb) {
+      res.status(503).json({ error: 'Database not configured' });
+      return;
+    }
+    const { error } = await sb.from('product_reviews').delete().eq('id', req.params.id);
+    if (error) {
+      res.status(400).json({ error: error.message });
+      return;
+    }
+    res.status(200).json({ success: true });
   } catch (err: any) {
-    return res.status(500).json({ error: 'Failed to fetch product suggestions and demand analytics.' });
+    res.status(400).json({ error: err?.message || 'Failed to delete review' });
   }
 });
 
-const productSuggestionUpdateSchema = z.object({
-  status: z.enum(['under_review', 'planned', 'converted_coming_soon', 'rejected']).optional(),
-  admin_notes: z.string().max(4000).optional(),
-  converted_product_id: z.string().nullable().optional()
+// ==========================================
+// 6. Catch-All Unmatched /api/* JSON 404 (TASK-002)
+// ==========================================
+app.all('/api/*', (_req: Request, res: Response) => {
+  res.status(404).json({ error: 'Not found' });
 });
 
-app.put('/api/admin/product-suggestions/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id;
-    const parsed = productSuggestionUpdateSchema.parse(req.body);
-    const result = await updateProductSuggestion(id, parsed);
-    if (!result.success) {
-      return res.status(404).json({ error: result.message || 'Suggestion not found.' });
-    }
-    return res.json({ success: true, suggestion: result.suggestion });
-  } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Invalid suggestion update payload.' });
-    }
-    return res.status(500).json({ error: 'Failed to update product suggestion.' });
-  }
-});
-
-// Feature D: Product Ratings & Customer Reviews (Public + Admin Moderation)
-const productReviewCreateSchema = z.object({
-  product_id: z.string().min(1),
-  customer_name: z.string().min(2).max(100),
-  rating: z.number().int().min(1).max(5),
-  review_text: z.string().max(2000).nullable().optional(),
-  lang: z.enum(['ar', 'en']).optional()
-});
-
-app.get('/api/reviews/:productId', async (req: Request, res: Response) => {
-  try {
-    const productId = req.params.productId;
-    const result = await getProductReviewsAndSummary(productId);
-    return res.json(result);
-  } catch (err: any) {
-    return res.status(500).json({ error: 'Failed to fetch product reviews.' });
-  }
-});
-
-app.post('/api/reviews', publicSubmissionRateLimiter, async (req: Request, res: Response) => {
-  try {
-    const parsed = productReviewCreateSchema.parse(req.body);
-    const result = await createProductReview(parsed);
-    if (!result.success) {
-      return res.status(400).json({ error: result.message });
-    }
-    return res.status(result.duplicate ? 200 : 201).json({
-      success: true,
-      duplicate: result.duplicate,
-      message: result.message,
-      review: result.review
-    });
-  } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: err.issues[0]?.message || 'Invalid review fields.' });
-    }
-    return res.status(500).json({ error: 'Failed to submit product review.' });
-  }
-});
-
-app.get('/api/admin/reviews', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const statusParam = req.query.status ? String(req.query.status) : 'all';
-    const productIdParam = req.query.productId ? String(req.query.productId) : undefined;
-    const status =
-      statusParam === 'pending' || statusParam === 'approved' || statusParam === 'rejected'
-        ? statusParam
-        : 'all';
-    const result = await listAdminProductReviews({
-      status,
-      productId: productIdParam,
-      isServerAuthorized: true
-    });
-    return res.json({ reviews: result.reviews });
-  } catch {
-    return res.status(500).json({ error: 'Failed to load admin product reviews.' });
-  }
-});
-
-const productReviewModerateSchema = z.object({
-  status: z.enum(['pending', 'approved', 'rejected'])
-});
-
-app.put('/api/admin/reviews/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id;
-    const parsed = productReviewModerateSchema.parse(req.body);
-    const result = await moderateProductReview(id, parsed.status, {
-      isServerAuthorized: true
-    });
-    if (!result.success) {
-      return res.status(404).json({ error: result.message || 'Review not found.' });
-    }
-    return res.json({ success: true, review: result.review });
-  } catch (err: any) {
-    if (err instanceof z.ZodError) {
-      return res.status(400).json({ error: 'Invalid review status.' });
-    }
-    return res.status(500).json({ error: 'Failed to update review status.' });
-  }
-});
-
-app.delete('/api/admin/reviews/:id', adminRateLimiter, requireAdmin, async (req: Request, res: Response) => {
-  try {
-    const id = req.params.id;
-    const result = await deleteProductReview(id, {
-      isServerAuthorized: true
-    });
-    if (!result.success) {
-      return res.status(404).json({ error: result.message || 'Review not found.' });
-    }
-    return res.json({ success: true });
-  } catch {
-    return res.status(500).json({ error: 'Failed to delete review.' });
-  }
-});
-
-// 4. SEO: SITEMAP & ROBOTS.TXT
-
-app.get('/sitemap.xml', async (req: Request, res: Response) => {
-  try {
-    const products = await fetchProducts({ publishedOnly: true });
-    const siteUrl = process.env.SITE_URL || process.env.NEXT_PUBLIC_SITE_URL || process.env.APP_URL || 'https://enginity-store-s8dx.vercel.app';
-
-    let xml = `<?xml version="1.0" encoding="UTF-8"?>
-<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9" xmlns:xhtml="http://www.w3.org/1999/xhtml">
-  <url>
-    <loc>${siteUrl}/ar</loc>
-    <xhtml:link rel="alternate" hreflang="ar" href="${siteUrl}/ar" />
-    <xhtml:link rel="alternate" hreflang="en" href="${siteUrl}/en" />
-    <changefreq>daily</changefreq>
-    <priority>1.0</priority>
-  </url>
-  <url>
-    <loc>${siteUrl}/en</loc>
-    <xhtml:link rel="alternate" hreflang="ar" href="${siteUrl}/ar" />
-    <xhtml:link rel="alternate" hreflang="en" href="${siteUrl}/en" />
-    <changefreq>daily</changefreq>
-    <priority>0.9</priority>
-  </url>`;
-
-    products.forEach(p => {
-      xml += `
-  <url>
-    <loc>${siteUrl}/ar/products/${p.slug}</loc>
-    <xhtml:link rel="alternate" hreflang="ar" href="${siteUrl}/ar/products/${p.slug}" />
-    <xhtml:link rel="alternate" hreflang="en" href="${siteUrl}/en/products/${p.slug}" />
-    <lastmod>${p.updated_at || p.created_at || new Date().toISOString()}</lastmod>
-    <changefreq>weekly</changefreq>
-    <priority>0.8</priority>
-  </url>`;
-    });
-
-    xml += '\n</urlset>';
-
-    res.header('Content-Type', 'application/xml');
-    res.send(xml);
-  } catch {
-    res.status(500).send('Error generating sitemap.');
-  }
-});
-
-app.get('/robots.txt', (req: Request, res: Response) => {
-  const siteUrl = process.env.SITE_URL || process.env.NEXT_PUBLIC_SITE_URL || process.env.APP_URL || 'https://enginity-store-s8dx.vercel.app';
-  const txt = `User-agent: *
-Allow: /
-Disallow: /admin
-Disallow: /api/admin/
-
-Sitemap: ${siteUrl}/sitemap.xml`;
-
-  res.header('Content-Type', 'text/plain');
-  res.send(txt);
-});
-
-// 5. VITE INTEGRATION FOR APP SPA ROUTING WITH SSR HEAD METADATA INJECTION
+// ==========================================
+// 7. Dev / Production Server Bootstrap
+// ==========================================
 async function startServer() {
-  const vite = await createViteServer({
-    server: { middlewareMode: true },
-    appType: 'spa'
-  });
-
-  app.use(vite.middlewares);
-
-  // Catch-all route for HTML head SEO tag injection
-  app.get('*', async (req: Request, res: Response, next: NextFunction) => {
-    const url = req.originalUrl;
-    try {
-      let indexHtml = fs.readFileSync(path.resolve(__dirname, 'index.html'), 'utf-8');
-      indexHtml = await vite.transformIndexHtml(url, indexHtml);
-
-      // Handle product details SEO injection
-      const productMatch = url.match(/^\/(ar|en)\/products\/([^\/]+)$/);
-      if (productMatch) {
-        const lang = productMatch[1];
-        const slug = productMatch[2];
-        const product = await fetchProductBySlug(slug, true);
-
-        if (product) {
-          const title = lang === 'ar' ? `${product.name_ar} | Enginity` : `${product.name_en} | Enginity`;
-          const desc = lang === 'ar' ? product.short_ar : product.short_en;
-          const ogImage = product.cover_path || product.diagram_path || '';
-
-          indexHtml = indexHtml
-            .replace(/<title>.*?<\/title>/, `<title>${title}</title>`)
-            .replace(/<meta name="description" content=".*?" \/>/, `<meta name="description" content="${desc}" />`)
-            .replace(/<meta property="og:title" content=".*?" \/>/, `<meta property="og:title" content="${title}" />`)
-            .replace(/<meta property="og:description" content=".*?" \/>/, `<meta property="og:description" content="${desc}" />`);
-
-          if (ogImage) {
-            indexHtml = indexHtml.replace('</head>', `<meta property="og:image" content="${ogImage}" /></head>`);
-          }
-        }
-      }
-
-      res.status(200).set({ 'Content-Type': 'text/html' }).end(indexHtml);
-    } catch (e) {
-      vite.ssrFixStacktrace(e as Error);
-      next(e);
-    }
-  });
+  if (process.env.NODE_ENV !== 'production') {
+    const { createServer: createViteServer } = await import('vite');
+    const vite = await createViteServer({
+      server: { middlewareMode: true },
+      appType: 'spa',
+    });
+    app.use(vite.middlewares);
+  } else {
+    app.use(express.static('dist'));
+    app.get('*', (_req: Request, res: Response) => {
+      res.sendFile('dist/index.html', { root: '.' });
+    });
+  }
 
   app.listen(PORT, '0.0.0.0', () => {
-    console.log(`🚀 Enginity Server running on http://0.0.0.0:${PORT}`);
+    console.log(`Server running on http://localhost:${PORT}`);
   });
 }
 
-startServer();
+if (!process.env.VERCEL && !process.env.VITEST && process.env.NODE_ENV !== 'test') {
+  startServer();
+}

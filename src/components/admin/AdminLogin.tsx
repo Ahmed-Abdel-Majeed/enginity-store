@@ -1,15 +1,22 @@
-import React, { useState } from 'react';
+import React, { useState, useEffect } from 'react';
 import { Lock, Mail, Key } from 'lucide-react';
 
 interface AdminLoginProps {
   onLogin: (email: string, pass: string) => Promise<boolean>;
+  initialError?: string | null;
 }
 
-export const AdminLogin: React.FC<AdminLoginProps> = ({ onLogin }) => {
+export const AdminLogin: React.FC<AdminLoginProps> = ({ onLogin, initialError }) => {
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState('');
-  const [error, setError] = useState('');
+  const [error, setError] = useState(initialError || '');
   const [loading, setLoading] = useState(false);
+
+  useEffect(() => {
+    if (initialError) {
+      setError(initialError);
+    }
+  }, [initialError]);
 
   const handleSubmit = async (e: React.FormEvent) => {
     e.preventDefault();
@@ -19,7 +26,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLogin }) => {
     try {
       const success = await onLogin(email, password);
       if (!success) {
-        setError('بيانات الدخول غير صحيحة أو الحساب غير مصرح له كمسؤول.');
+        setError('بيانات الدخول غير صحيحة أو الحساب غير مصرح له كمسؤول في جدول admins.');
       }
     } catch {
       setError('حدث خطأ أثناء محاولة الاتصال بخادم المصادقة.');
@@ -29,7 +36,7 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLogin }) => {
   };
 
   return (
-    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4 font-cairo">
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center p-4 font-cairo" dir="rtl">
       <div className="max-w-md w-full bg-slate-900 border border-slate-800 rounded-2xl p-8 space-y-6 shadow-2xl">
         
         {/* Header */}
@@ -46,19 +53,26 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLogin }) => {
         </div>
 
         {error && (
-          <div className="p-3 bg-red-950/60 border border-red-800 text-red-300 text-xs rounded-xl font-medium text-start">
+          <div
+            role="alert"
+            className="p-3 bg-red-950/60 border border-red-800 text-red-300 text-xs rounded-xl font-medium text-start"
+          >
             {error}
           </div>
         )}
 
         <form onSubmit={handleSubmit} className="space-y-4 text-start">
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-300">البريد الإلكتروني</label>
+            <label htmlFor="admin-email-input" className="text-xs font-semibold text-slate-300">
+              البريد الإلكتروني
+            </label>
             <div className="relative">
               <Mail className="w-4 h-4 text-slate-500 absolute inset-y-0 start-3 my-auto" />
               <input
+                id="admin-email-input"
                 type="email"
                 required
+                dir="ltr"
                 value={email}
                 onChange={e => setEmail(e.target.value)}
                 placeholder="admin@enginity.com"
@@ -68,12 +82,16 @@ export const AdminLogin: React.FC<AdminLoginProps> = ({ onLogin }) => {
           </div>
 
           <div className="space-y-1.5">
-            <label className="text-xs font-semibold text-slate-300">كلمة المرور</label>
+            <label htmlFor="admin-password-input" className="text-xs font-semibold text-slate-300">
+              كلمة المرور
+            </label>
             <div className="relative">
               <Key className="w-4 h-4 text-slate-500 absolute inset-y-0 start-3 my-auto" />
               <input
+                id="admin-password-input"
                 type="password"
                 required
+                dir="ltr"
                 value={password}
                 onChange={e => setPassword(e.target.value)}
                 placeholder="••••••••"

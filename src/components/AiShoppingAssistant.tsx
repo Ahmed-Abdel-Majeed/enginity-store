@@ -1,4 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
+import ReactMarkdown from 'react-markdown';
+import rehypeSanitize from 'rehype-sanitize';
 import {
   Bot,
   X,
@@ -17,13 +19,17 @@ import {
 import {
   AssistantChatMessage,
   AssistantProductRecommendation,
+  Currency,
   Lang,
   StoreSettings
 } from '../types';
 import { sendAssistantMessage } from '../lib/data-store';
+import { formatPrice } from '../lib/utils';
+import { useModalA11y } from '../lib/use-modal-a11y';
 
 interface AiShoppingAssistantProps {
   lang: Lang;
+  currency?: Currency;
   settings: StoreSettings;
   isOpen: boolean;
   onToggleOpen: (open: boolean) => void;
@@ -34,6 +40,7 @@ interface AiShoppingAssistantProps {
 
 export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
   lang,
+  currency = 'EGP',
   settings,
   isOpen,
   onToggleOpen,
@@ -42,6 +49,12 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
   onOpenProductSuggestion
 }) => {
   const isAr = lang === 'ar';
+  const usdRate = settings?.usd_rate || 50;
+
+  const dialogRef = useModalA11y<HTMLDivElement>({
+    isOpen,
+    onClose: () => onToggleOpen(false)
+  });
 
   const getInitialWelcomeMessage = (): AssistantChatMessage => ({
     id: 'welcome-msg',
@@ -93,8 +106,8 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
   }, [lang]);
 
   useEffect(() => {
-    if (isOpen) {
-      messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    if (isOpen && typeof messagesEndRef.current?.scrollIntoView === 'function') {
+      messagesEndRef.current.scrollIntoView({ behavior: 'smooth' });
     }
   }, [messages, isOpen, loading]);
 
@@ -115,6 +128,21 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
   const handleSend = async (textOverride?: string) => {
     const query = (textOverride ?? input).trim();
     if (!query || loading || inFlightRef.current) return;
+
+    if (query.length > 500) {
+      setMessages(prev => [
+        ...prev,
+        {
+          id: `err-${Date.now()}`,
+          role: 'assistant',
+          content: isAr
+            ? 'عذراً، الرسالة طويلة جداً (الحد الأقصى 500 حرف). يرجى اختصار سؤالك.'
+            : 'Sorry, your message exceeds the 500-character limit. Please shorten your question.',
+          timestamp: new Date().toISOString()
+        }
+      ]);
+      return;
+    }
 
     inFlightRef.current = true;
     setLastQuery(query);
@@ -242,19 +270,19 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
               </span>
             ))}
           </div>
-          <div className="flex flex-col items-end shrink-0">
+          <div className="flex flex-col items-end shrink-0" dir="ltr">
             {rec.discount_percentage && rec.discount_percentage > 0 && rec.original_price_egp ? (
               <div className="flex items-center gap-1.5">
                 <span className="px-1.5 py-0.2 rounded bg-emerald-500/20 text-emerald-300 border border-emerald-500/30 text-[10px] font-bold">
                   {isAr ? `خصم ${rec.discount_percentage}%` : `${rec.discount_percentage}% OFF`}
                 </span>
                 <span className="text-[10px] text-slate-500 line-through tabular-nums">
-                  {rec.original_price_egp} {isAr ? 'ج.م' : 'EGP'}
+                  {formatPrice(rec.original_price_egp, currency, lang, usdRate)}
                 </span>
               </div>
             ) : null}
             <div className="text-xs font-bold text-teal-400 tabular-nums">
-              {rec.price_egp} {isAr ? 'ج.م' : 'EGP'}
+              {formatPrice(rec.price_egp, currency, lang, usdRate)}
             </div>
           </div>
         </div>
@@ -292,7 +320,7 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
       {/* Floating Launcher Button */}
       {!isOpen && (
         <div
-          className={`fixed bottom-5 z-40 ${isAr ? 'left-5' : 'right-5'}`}
+          className="fixed bottom-5 end-5 z-40"
           dir={isAr ? 'rtl' : 'ltr'}
         >
           <button
@@ -325,8 +353,13 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
           role="dialog"
           aria-modal="true"
           aria-labelledby="ai-assistant-title"
+          onClick={() => onToggleOpen(false)}
         >
-          <div className="relative w-full max-w-md bg-[#0b1324] border-s border-slate-800 h-full flex flex-col shadow-2xl">
+          <div
+            ref={dialogRef}
+            onClick={e => e.stopPropagation()}
+            className="relative w-full max-w-md bg-[#0b1324] border-s border-slate-800 h-full max-h-[100dvh] flex flex-col shadow-2xl"
+          >
             {/* Header */}
             <div className="px-5 py-4 border-b border-slate-800/90 bg-slate-900/80 flex items-center justify-between">
               <div className="flex items-center gap-3">
@@ -353,6 +386,7 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
                   type="button"
                   onClick={handleReset}
                   title={isAr ? 'بدء محادثة جديدة' : 'Reset conversation'}
+                  aria-label={isAr ? 'بدء محادثة جديدة' : 'Reset conversation'}
                   className="p-2 rounded-lg text-slate-400 hover:text-white hover:bg-slate-800/70 transition-colors"
                 >
                   <RotateCcw className="w-4 h-4" />
@@ -390,7 +424,32 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
                           : 'bg-slate-900/95 border border-slate-800 text-slate-200'
                       }`}
                     >
-                      {msg.content}
+                      {isUser ? (
+                        msg.content
+                      ) : (
+                        <ReactMarkdown
+                          rehypePlugins={[rehypeSanitize]}
+                          components={{
+                            a: ({ href, children }) => {
+                              const safeHref = typeof href === 'string' ? href.trim() : '';
+                              if (/^\/(ar|en)(\/|$)/.test(safeHref)) {
+                                return (
+                                  <a
+                                    href={safeHref}
+                                    className="text-blue-400 underline hover:text-blue-300"
+                                  >
+                                    {children}
+                                  </a>
+                                );
+                              }
+                              return <span className="text-slate-300">{children}</span>;
+                            },
+                            p: ({ children }) => <p className="mb-1.5 last:mb-0">{children}</p>
+                          }}
+                        >
+                          {msg.content}
+                        </ReactMarkdown>
+                      )}
                     </div>
 
                     {msg.id.startsWith('err-') && lastQuery && (
@@ -584,6 +643,7 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
             >
               <input
                 type="text"
+                maxLength={500}
                 value={input}
                 onChange={e => setInput(e.target.value)}
                 placeholder={
@@ -591,6 +651,7 @@ export const AiShoppingAssistant: React.FC<AiShoppingAssistantProps> = ({
                     ? 'اكتب احتياجك أو اسم المنصة التي تريد أتمتتها...'
                     : 'Describe your automation goal or platform...'
                 }
+                aria-label={isAr ? 'رسالتك للمساعد الذكي' : 'Your message to AI assistant'}
                 className="flex-1 px-3.5 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-white text-xs focus:border-blue-500 focus:outline-none"
               />
               <button

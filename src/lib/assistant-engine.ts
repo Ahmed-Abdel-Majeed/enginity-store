@@ -1120,26 +1120,33 @@ export async function processAssistantTurn(
   // Step 2: Intent Detection BEFORE deciding whether to query catalog or call n8n
   const intent = detectUserIntent(userMessage);
 
-  // Step 3: Route B — General Conversation (`general_agent`) -> Call n8n Webhook
+  // Step 3: Route B — General Conversation (`general_agent`) -> Call Server Proxy or n8n Webhook
   if (intent.isGeneralAgentConversation) {
     let n8nCallCount = 0;
+    const isBrowser = typeof window !== 'undefined';
+    const hasCustomOverride = Boolean(params.webhookUrlOverride || params.webhookFetchFn);
+
     const n8nAssistantUrl =
       params.webhookUrlOverride ||
-      (typeof process !== 'undefined' && process.env.N8N_ASSISTANT_WEBHOOK_URL) ||
-      DEFAULT_N8N_WEBHOOK_URL;
+      (isBrowser && !hasCustomOverride
+        ? '/api/assistant/chat'
+        : (typeof process !== 'undefined' && process.env?.N8N_ASSISTANT_WEBHOOK_URL) ||
+          DEFAULT_N8N_WEBHOOK_URL);
 
     const fetchImpl = params.webhookFetchFn || fetch;
+    const isAllowedTarget =
+      n8nAssistantUrl.startsWith('https://') || n8nAssistantUrl.startsWith('/api/');
 
-    if (!params.simulateProviderOutage && n8nAssistantUrl && n8nAssistantUrl.startsWith('https://')) {
+    if (!params.simulateProviderOutage && n8nAssistantUrl && isAllowedTarget) {
       try {
         n8nCallCount += 1;
         const controller = new AbortController();
-        const timeout = setTimeout(() => controller.abort(), 8000);
+        const timeout = setTimeout(() => controller.abort(), 10_000);
         const res = await fetchImpl(n8nAssistantUrl, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
-            ...(typeof process !== 'undefined' && process.env.N8N_ASSISTANT_SECRET
+            ...(!isBrowser && typeof process !== 'undefined' && process.env?.N8N_ASSISTANT_SECRET
               ? { Authorization: `Bearer ${process.env.N8N_ASSISTANT_SECRET}` }
               : {})
           },
@@ -1148,7 +1155,9 @@ export async function processAssistantTurn(
             conversationId: params.conversationId || '',
             sessionId: params.sessionId || '',
             locale: lang,
+            language: lang,
             page: params.page || '',
+            pathname: params.page || '',
             context: params.context || 'Enginity Marketplace Customer Support',
             history: (params.history || []).slice(-6)
           }),

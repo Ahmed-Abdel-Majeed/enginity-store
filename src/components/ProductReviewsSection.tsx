@@ -2,6 +2,11 @@ import React, { useState } from 'react';
 import { Star, MessageSquarePlus, CheckCircle2, AlertCircle, User, ShieldCheck, Sparkles } from 'lucide-react';
 import { Lang, ProductRatingSummary, ProductReview } from '../types';
 import { submitProductReview } from '../lib/data-store';
+import {
+  checkSubmissionCooldown,
+  recordSubmissionTimestamp,
+  isHoneypotTriggered
+} from '../lib/validation';
 
 interface ProductReviewsSectionProps {
   productId: string;
@@ -29,6 +34,7 @@ export const ProductReviewsSection: React.FC<ProductReviewsSectionProps> = ({
   const [selectedRating, setSelectedRating] = useState<number>(0);
   const [hoverRating, setHoverRating] = useState<number>(0);
   const [reviewText, setReviewText] = useState('');
+  const [honeypot, setHoneypot] = useState('');
   const [submitting, setSubmitting] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
   const [successMsg, setSuccessMsg] = useState<string | null>(null);
@@ -72,6 +78,25 @@ export const ProductReviewsSection: React.FC<ProductReviewsSectionProps> = ({
     setErrorMsg(null);
     setSuccessMsg(null);
 
+    if (isHoneypotTriggered(honeypot)) {
+      setSuccessMsg(
+        isAr
+          ? 'شكراً لتقييمك! تم استلام مراجعتك بنجاح وستظهر بعد مراجعة الإدارة.'
+          : 'Thank you! Your review has been submitted and is pending moderation.'
+      );
+      return;
+    }
+
+    const cooldown = checkSubmissionCooldown(`review_${productId}`);
+    if (!cooldown.allowed) {
+      setErrorMsg(
+        isAr
+          ? `يرجى الانتظار ${cooldown.remainingSeconds} ثانية قبل إرسال تقييم آخر.`
+          : `Please wait ${cooldown.remainingSeconds} seconds before submitting another review.`
+      );
+      return;
+    }
+
     const trimmedName = customerName.trim();
     const trimmedReview = reviewText.trim();
 
@@ -109,12 +134,14 @@ export const ProductReviewsSection: React.FC<ProductReviewsSectionProps> = ({
         customer_name: trimmedName,
         rating: selectedRating,
         review_text: trimmedReview || null,
-        lang
+        lang,
+        website_url: honeypot
       });
 
       if (!result.success) {
         setErrorMsg(result.message);
       } else {
+        recordSubmissionTimestamp(`review_${productId}`);
         setSuccessMsg(result.message);
         setCustomerName('');
         setSelectedRating(0);
@@ -174,7 +201,7 @@ export const ProductReviewsSection: React.FC<ProductReviewsSectionProps> = ({
         {summary.totalReviews > 0 && (
           <div className="inline-flex items-center gap-2 px-3.5 py-2 rounded-2xl bg-amber-50/90 border border-amber-200/80 text-slate-900">
             <Star className="w-4 h-4 fill-amber-400 text-amber-500 shrink-0" />
-            <span className="font-heading font-extrabold text-sm text-slate-900">
+            <span className="font-heading font-extrabold text-sm text-slate-900" dir="ltr">
               {summary.averageRating.toFixed(1)} / 5
             </span>
             <span className="text-slate-300">·</span>
@@ -219,7 +246,7 @@ export const ProductReviewsSection: React.FC<ProductReviewsSectionProps> = ({
               {/* Summary & Distribution Card */}
               <div className="p-5 sm:p-6 rounded-2xl bg-slate-50/80 border border-slate-200/80 grid grid-cols-1 sm:grid-cols-12 gap-6 items-center">
                 <div className="sm:col-span-5 text-center sm:border-e border-slate-200/80 sm:pe-5 space-y-1.5">
-                  <div className="font-heading font-extrabold text-4xl sm:text-5xl text-[#0B1F3A]">
+                  <div className="font-heading font-extrabold text-4xl sm:text-5xl text-[#0B1F3A]" dir="ltr">
                     {summary.averageRating.toFixed(1)}
                   </div>
                   <div className="flex items-center justify-center gap-1 py-1">
@@ -341,6 +368,19 @@ export const ProductReviewsSection: React.FC<ProductReviewsSectionProps> = ({
             className="p-5 sm:p-6 rounded-2xl bg-[#0B1F3A] text-white border border-slate-800 shadow-lg space-y-4"
             noValidate
           >
+            {/* Hidden Honeypot Input */}
+            <div className="hidden" aria-hidden="true">
+              <label htmlFor="review-website-url">Website</label>
+              <input
+                id="review-website-url"
+                type="text"
+                tabIndex={-1}
+                autoComplete="off"
+                value={honeypot}
+                onChange={e => setHoneypot(e.target.value)}
+              />
+            </div>
+
             <div className="flex items-center gap-2.5 border-b border-slate-800 pb-3.5">
               <div className="w-9 h-9 rounded-xl bg-blue-500/20 border border-blue-400/30 text-blue-400 flex items-center justify-center shrink-0">
                 <MessageSquarePlus className="w-4 h-4" />
@@ -461,7 +501,7 @@ export const ProductReviewsSection: React.FC<ProductReviewsSectionProps> = ({
                 >
                   {isAr ? 'مراجعتك وتجربتك (اختياري)' : 'Your Review (Optional)'}
                 </label>
-                <span className="text-[10px] text-slate-400 font-mono">
+                <span className="text-[10px] text-slate-400 font-mono" dir="ltr">
                   {reviewText.length}/2000
                 </span>
               </div>

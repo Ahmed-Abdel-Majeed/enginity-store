@@ -177,13 +177,13 @@ export const CustomRequestsList: React.FC = () => {
       {/* Search & Filter Controls */}
       <div className="grid grid-cols-1 sm:grid-cols-3 gap-3">
         <div className="sm:col-span-2 relative">
-          <Search className="w-4 h-4 text-slate-400 absolute right-3.5 top-1/2 -translate-y-1/2" />
+          <Search className="w-4 h-4 text-slate-400 absolute start-3.5 top-1/2 -translate-y-1/2" />
           <input
             type="text"
             value={searchQuery}
             onChange={e => setSearchQuery(e.target.value)}
             placeholder="ابحث بالاسم، الإيميل، رقم الواتساب، نوع النشاط، أو المشكلة..."
-            className="w-full pr-10 pl-4 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-white text-xs focus:border-blue-500 focus:outline-none"
+            className="w-full ps-10 pe-4 py-2.5 rounded-xl bg-slate-900 border border-slate-800 text-white text-xs focus:border-blue-500 focus:outline-none"
           />
         </div>
         <select
@@ -212,7 +212,7 @@ export const CustomRequestsList: React.FC = () => {
       ) : (
         <div className="grid grid-cols-1 lg:grid-cols-12 gap-5">
           {/* Left Column: Requests List */}
-          <div className="lg:col-span-5 space-y-2.5 max-h-[680px] overflow-y-auto pr-1">
+          <div className="lg:col-span-5 space-y-2.5 max-h-[680px] overflow-y-auto pe-1">
             {filtered.map(req => {
               const isSelected = selectedRequest?.id === req.id;
               const badge = STATUS_LABELS[req.status] || STATUS_LABELS.new;
@@ -221,7 +221,7 @@ export const CustomRequestsList: React.FC = () => {
                   key={req.id}
                   type="button"
                   onClick={() => selectRequest(req)}
-                  className={`w-full text-right p-4 rounded-xl border transition-all space-y-2 ${
+                  className={`w-full text-start p-4 rounded-xl border transition-all space-y-2 ${
                     isSelected
                       ? 'bg-blue-500/10 border-blue-500/50 shadow-lg'
                       : 'bg-slate-900/70 border-slate-800 hover:border-slate-700'

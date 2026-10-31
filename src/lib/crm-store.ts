@@ -1,673 +1,1067 @@
+import { SupabaseClient } from '@supabase/supabase-js';
 import {
   CustomAutomationRequest,
   CustomRequestStatus,
   DemandAnalyticsSummary,
-  DemandIdeaGroup,
   Lang,
   ProductRatingSummary,
   ProductReview,
   ProductReviewStatus,
   ProductSuggestion,
   ProductSuggestionStatus,
-  PurchaseLikelihood
+  PurchaseLikelihood,
+  WaitlistEntry,
 } from '../types';
-import { getSupabaseAdmin, getSystemAdminSupabase, supabase } from './supabase';
-import { computeProductRatingSummary, normalizePhoneNumber } from './utils';
+import {
+  supabase,
+  isSupabaseConfigured,
+  createAuthenticatedClient,
+  verifyAdminSession,
+  getSystemAdminToken,
+} from './supabase';
+import { computeProductRatingSummary } from './utils';
+import { isHoneypotTriggered } from './validation';
 
-const PRIVATE_CRM_BUCKET = 'private-crm';
-const CUSTOM_REQUESTS_FILE = 'custom_requests.json';
-const PRODUCT_SUGGESTIONS_FILE = 'product_suggestions.json';
-const PRODUCT_REVIEWS_FILE = 'product_reviews.json';
+const EMAIL_REGEX = /^[^\s@]+@[^\s@]+\.[^\s@]{2,}$/i;
 
-function generateUuid(): string {
-  if (typeof crypto !== 'undefined' && typeof crypto.randomUUID === 'function') {
-    return crypto.randomUUID();
+export type AdminAuthArg =
+  | string
+  | null
+  | undefined
+  | { token?: string | null; requireAuthCheck?: boolean };
+
+async function resolveAdminSupabaseClient(
+  authArg?: AdminAuthArg
+): Promise<{ client: SupabaseClient | null; unauthorized: boolean; error?: string }> {
+  if (!isSupabaseConfigured()) {
+    return { client: null, unauthorized: true, error: 'Supabase is not configured.' };
   }
-  return 'xxxxxxxx-xxxx-4xxx-yxxx-xxxxxxxxxxxx'.replace(/[xy]/g, c => {
-    const r = (Math.random() * 16) | 0;
-    const v = c === 'x' ? r : (r & 0x3) | 0x8;
-    return v.toString(16);
+
+  const isObj = typeof authArg === 'object' && authArg !== null;
+  const explicitToken = isObj ? authArg.token : authArg;
+  const requireAuthCheck = isObj ? Boolean(authArg.requireAuthCheck) : false;
+
+  if (requireAuthCheck && (!explicitToken || !String(explicitToken).trim())) {
+    return {
+      client: null,
+      unauthorized: true,
+      error: 'Missing administrator access token.',
+    };
+  }
+
+  let token = explicitToken ? String(explicitToken).trim() : null;
+  if (!token) {
+    if (typeof window !== 'undefined') {
+      const verification = await verifyAdminSession();
+      if (!verification.isAuthenticated || !verification.isAdmin || !verification.accessToken) {
+        return {
+          client: null,
+          unauthorized: true,
+          error:
+            verification.error ||
+            'Unauthorized: Active administrator session required.',
+        };
+      }
+      token = verification.accessToken;
+    } else {
+      token = await getSystemAdminToken();
+    }
+  }
+
+  if (!token) {
+    return { client: null, unauthorized: true, error: 'Missing administrator access token.' };
+  }
+
+  const authedClient = createAuthenticatedClient(token);
+  const { data: isAdmin, error: rpcError } = await authedClient.rpc('is_admin');
+  if (rpcError || !isAdmin) {
+    return {
+      client: null,
+      unauthorized: true,
+      error: rpcError?.message || 'Forbidden: User is not an authorized administrator.',
+    };
+  }
+
+  return { client: authedClient, unauthorized: false };
+}
+
+// ==========================================
+// 1. Product Waitlist (TASK-006, TASK-007)
+// ==========================================
+export interface SubmitWaitlistInput {
+  product_id?: string;
+  productId?: string;
+  email?: string;
+  whatsapp_number?: string;
+  whatsappNumber?: string;
+  interest_note?: string;
+  emailConsent?: boolean;
+  whatsappConsent?: boolean;
+  lang?: Lang;
+  website_url?: string;
+}
+
+const recentWaitlistSubmissions = new Map<string, number>();
+
+export async function submitWaitlistEntry(input: SubmitWaitlistInput): Promise<{
+  success: boolean;
+  alreadyRegistered?: boolean;
+  message: string;
+  data: WaitlistEntry | null;
+  error: string | null;
+}> {
+  const isAr = (input.lang || 'ar') === 'ar';
+
+  if (isHoneypotTriggered(input)) {
+    return {
+      success: true,
+      alreadyRegistered: false,
+      message: isAr ? 'تم تسجيل اهتمامك بنجاح.' : 'Successfully registered on waitlist.',
+      data: null,
+      error: null,
+    };
+  }
+
+  const productId = String(input.product_id || input.productId || '').trim();
+  const cleanEmail = String(input.email || '').trim().toLowerCase();
+  const cleanWhatsapp = String(input.whatsapp_number || input.whatsappNumber || '').trim();
+  const interestNote = String(input.interest_note || '').trim();
+
+  if (!productId) {
+    const msg = isAr ? 'معرف المنتج مطلوب.' : 'Product ID is required.';
+    return { success: false, message: msg, data: null, error: msg };
+  }
+
+  if (!cleanEmail && !cleanWhatsapp) {
+    const msg = isAr
+      ? 'يرجى إدخال البريد الإلكتروني أو رقم الواتساب.'
+      : 'Please provide an email address or WhatsApp number.';
+    return { success: false, message: msg, data: null, error: msg };
+  }
+
+  if (cleanEmail && !EMAIL_REGEX.test(cleanEmail)) {
+    const msg = isAr ? 'صيغة البريد الإلكتروني غير صحيحة.' : 'Invalid email address format.';
+    return { success: false, message: msg, data: null, error: msg };
+  }
+
+  if (!isSupabaseConfigured()) {
+    const msg = isAr ? 'قاعدة البيانات غير متصلة.' : 'Database is not configured.';
+    return { success: false, message: msg, data: null, error: msg };
+  }
+
+  const recentWaitlistKey = `${productId}::${cleanEmail || cleanWhatsapp}`;
+  const existingWaitlistTs = recentWaitlistSubmissions.get(recentWaitlistKey) || 0;
+  if (Date.now() - existingWaitlistTs < 300_000) {
+    const dupMsg = isAr
+      ? 'أنت مسجل بالفعل في قائمة الانتظار لهذا المنتج! سنقوم بإشعارك فور الإطلاق.'
+      : 'You are already registered on the waitlist for this product!';
+    return {
+      success: true,
+      alreadyRegistered: true,
+      message: dupMsg,
+      data: null,
+      error: null,
+    };
+  }
+
+  const effectiveEmail = cleanEmail || '';
+
+  const { error } = await supabase.from('product_waitlist').insert({
+    product_id: productId,
+    email: effectiveEmail,
+    whatsapp_number: cleanWhatsapp || '',
+    email_consent: cleanEmail ? (input.emailConsent ?? true) : false,
+    whatsapp_consent: cleanWhatsapp ? (input.whatsappConsent ?? true) : false,
+    consent_text_ar: 'موافقة صريحة على استلام إشعار إطلاق المنتج',
+    consent_text_en: 'Explicit consent to receive product launch notification',
   });
-}
 
-export function computeSimpleHash(input: string): string {
-  let hash = 5381;
-  const clean = input.trim().toLowerCase();
-  for (let i = 0; i < clean.length; i++) {
-    hash = ((hash << 5) + hash) + clean.charCodeAt(i);
-    hash = hash & hash;
-  }
-  return Math.abs(hash).toString(36);
-}
-
-const memoryStoreCache = new Map<string, any[]>();
-
-async function ensurePrivateBucket(adminSb: any): Promise<void> {
-  try {
-    await adminSb.storage.createBucket(PRIVATE_CRM_BUCKET, { public: false });
-  } catch {
-    // Bucket already exists or handled
-  }
-}
-
-async function readPrivateJsonList<T extends { id?: string }>(
-  adminSb: any,
-  fileName: string
-): Promise<T[]> {
-  const cached = (memoryStoreCache.get(fileName) as T[] | undefined) || [];
-  try {
-    const { data, error } = await adminSb.storage.from(PRIVATE_CRM_BUCKET).download(fileName);
-    if (error || !data) return [...cached];
-    const text = await data.text();
-    if (!text) return [...cached];
-    const parsed = JSON.parse(text);
-    const remoteList: T[] = Array.isArray(parsed) ? parsed : [];
-
-    // Merge cached (newest in-memory updates) with remoteList by id
-    const byId = new Map<string, T>();
-    for (const item of remoteList) {
-      if (item && item.id) byId.set(item.id, item);
+  if (error) {
+    if (error.code === '23505' || error.message?.toLowerCase().includes('duplicate')) {
+      recentWaitlistSubmissions.set(recentWaitlistKey, Date.now());
+      const dupMsg = isAr
+        ? 'أنت مسجل بالفعل في قائمة الانتظار لهذا المنتج! سنقوم بإشعارك فور الإطلاق.'
+        : 'You are already registered on the waitlist for this product!';
+      return {
+        success: true,
+        alreadyRegistered: true,
+        message: dupMsg,
+        data: null,
+        error: null,
+      };
     }
-    for (const item of cached) {
-      if (item && item.id) byId.set(item.id, item);
-    }
-    const merged = Array.from(byId.values());
-    memoryStoreCache.set(fileName, merged);
-    return merged;
-  } catch {
-    return [...cached];
+
+    const errMsg =
+      error.message || (isAr ? 'تعذر التسجيل في قائمة الانتظار.' : 'Failed to join waitlist.');
+    return {
+      success: false,
+      message: errMsg,
+      data: null,
+      error: errMsg,
+    };
   }
+
+  recentWaitlistSubmissions.set(recentWaitlistKey, Date.now());
+
+  const entry: WaitlistEntry = {
+    id: '',
+    product_id: productId,
+    email: effectiveEmail,
+    whatsapp_number: cleanWhatsapp,
+    interest_note: interestNote,
+    email_consent: cleanEmail ? (input.emailConsent ?? true) : false,
+    whatsapp_consent: cleanWhatsapp ? (input.whatsappConsent ?? true) : false,
+    lang: input.lang || 'ar',
+    created_at: new Date().toISOString(),
+  };
+
+  return {
+    success: true,
+    alreadyRegistered: false,
+    message: isAr
+      ? 'تم تسجيلك في قائمة الانتظار بنجاح! سنبلغك فور إطلاق المنتج.'
+      : 'Successfully joined the waitlist! We will notify you upon launch.',
+    data: entry,
+    error: null,
+  };
 }
 
-async function writePrivateJsonList<T extends { id?: string }>(
-  adminSb: any,
-  fileName: string,
-  list: T[]
-): Promise<boolean> {
-  memoryStoreCache.set(fileName, [...list]);
-  try {
-    await ensurePrivateBucket(adminSb);
-    const payload = JSON.stringify(list, null, 2);
-    const body =
-      typeof Blob !== 'undefined'
-        ? new Blob([payload], { type: 'application/json' })
-        : payload;
-    const { error } = await adminSb.storage.from(PRIVATE_CRM_BUCKET).upload(fileName, body, {
-      upsert: true,
-      contentType: 'application/json',
-      cacheControl: '0'
-    });
-    return !error;
-  } catch (err) {
-    console.error(`Failed writing ${fileName} to private storage:`, err);
-    return false;
+export const registerWaitlistInterest = submitWaitlistEntry;
+
+export async function fetchWaitlistEntries(productId?: string): Promise<WaitlistEntry[]> {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient();
+  if (unauthorized || !client) {
+    throw new Error(error || 'Unauthorized admin access');
   }
+
+  let query = client
+    .from('product_waitlist')
+    .select('*')
+    .order('created_at', { ascending: false });
+
+  if (productId) {
+    query = query.eq('product_id', productId);
+  }
+
+  const { data, error: dbError } = await query;
+  if (dbError) {
+    throw new Error(dbError.message);
+  }
+
+  return (data || []) as WaitlistEntry[];
 }
 
-// ============================================================================
-// FEATURE B: CUSTOM AUTOMATION REQUESTS
-// ============================================================================
-
-export interface SubmitCustomRequestInput {
+// ==========================================
+// 2. Custom Automation Requests (TASK-006, TASK-007)
+// ==========================================
+export interface CreateCustomAutomationRequestInput {
   name?: string;
+  full_name?: string;
   email: string;
   whatsapp_number?: string;
-  business_type: string;
-  business_problem: string;
-  desired_outcome: string;
-  current_tools?: string[] | string;
+  business_type?: string;
+  industry?: string;
+  brand_name?: string;
+  business_problem?: string;
+  pain_points?: string;
+  current_workflow?: string;
+  desired_outcome?: string;
+  automation_goal?: string;
+  current_tools?: string[];
+  platforms_involved?: string[];
+  existing_tools?: string;
   expected_features?: string;
   budget_range?: string;
   delivery_timeframe?: string;
+  timeline_urgency?: 'urgent' | '1_2_weeks' | 'within_month' | 'flexible';
   additional_notes?: string;
   marketing_consent?: boolean;
+  need_consultation_first?: boolean;
+  preferred_contact_method?: 'whatsapp' | 'email' | 'both';
   lang?: Lang;
+  website_url?: string;
 }
 
+function mapDbRowToCustomRequest(row: any): CustomAutomationRequest {
+  const fullName = row.full_name || row.name || '';
+  const businessType = row.industry || row.business_type || row.brand_name || '';
+  const businessProblem = row.pain_points || row.business_problem || row.business_description || '';
+  const desiredOutcome = row.automation_goal || row.desired_outcome || '';
+  const platforms = Array.isArray(row.platforms_involved)
+    ? row.platforms_involved
+    : Array.isArray(row.current_tools)
+    ? row.current_tools
+    : [];
+
+  let parsedExtra: Record<string, any> = {};
+  if (typeof row.additional_notes === 'string' && row.additional_notes.includes('<!--META:')) {
+    const match = row.additional_notes.match(/<!--META:(\{[\s\S]*?\})-->/);
+    if (match) {
+      try {
+        parsedExtra = JSON.parse(match[1]);
+      } catch {
+        // Ignore
+      }
+    }
+  }
+
+  const cleanNotes =
+    typeof row.additional_notes === 'string'
+      ? row.additional_notes.replace(/<!--META:\{[\s\S]*?\}-->/g, '').trim()
+      : '';
+
+  const rawStatus = parsedExtra.ui_status || row.status || 'new';
+  const uiStatusMap: Record<string, CustomRequestStatus> = {
+    new: 'new',
+    reviewing: 'reviewing',
+    reviewed: 'reviewing',
+    needs_clarification: 'needs_clarification',
+    quoted: 'quoted',
+    contacted: 'quoted',
+    accepted: 'accepted',
+    in_progress: 'accepted',
+    rejected: 'rejected',
+    completed: 'completed',
+    closed: 'completed',
+  };
+
+  return {
+    id: String(row.id),
+    name: fullName,
+    full_name: fullName,
+    brand_name: row.brand_name || businessType,
+    industry: businessType,
+    business_type: businessType,
+    email: row.email || '',
+    whatsapp_number: row.whatsapp_number || '',
+    preferred_contact_method: row.preferred_contact_method || 'whatsapp',
+    business_description: row.business_description || businessProblem,
+    business_problem: businessProblem,
+    current_workflow: row.current_workflow || '',
+    pain_points: businessProblem,
+    automation_goal: desiredOutcome,
+    desired_outcome: desiredOutcome,
+    platforms_involved: platforms,
+    current_tools: platforms,
+    existing_tools: row.existing_tools || platforms.join(', '),
+    expected_features: row.current_workflow || parsedExtra.expected_features || '',
+    expected_volume: row.expected_volume || '',
+    timeline_urgency: row.timeline_urgency || 'flexible',
+    delivery_timeframe:
+      parsedExtra.delivery_timeframe || row.expected_volume || row.timeline_urgency || '',
+    budget_range: row.budget_range || '',
+    need_consultation_first: Boolean(row.need_consultation_first),
+    marketing_consent: parsedExtra.marketing_consent ?? true,
+    additional_notes: cleanNotes,
+    status: uiStatusMap[rawStatus] || 'new',
+    estimated_quote_egp:
+      parsedExtra.estimated_quote_egp !== undefined ? parsedExtra.estimated_quote_egp : null,
+    admin_notes: row.admin_notes || '',
+    created_at: row.created_at || new Date().toISOString(),
+    updated_at: row.updated_at || new Date().toISOString(),
+  };
+}
+
+function normalizeDbCustomStatus(status?: CustomRequestStatus): string {
+  if (!status) return 'new';
+  const valid = [
+    'new',
+    'reviewing',
+    'needs_clarification',
+    'quoted',
+    'accepted',
+    'rejected',
+    'completed',
+  ];
+  if (valid.includes(status)) return status;
+  return 'new';
+}
+
+const recentCustomRequestFingerprints = new Map<string, number>();
+
 export async function createCustomAutomationRequest(
-  input: SubmitCustomRequestInput
+  input: CreateCustomAutomationRequestInput
 ): Promise<{
   success: boolean;
   duplicate?: boolean;
-  request?: CustomAutomationRequest;
   message: string;
+  requestId?: string;
+  request?: CustomAutomationRequest;
+  record?: CustomAutomationRequest;
+  item?: CustomAutomationRequest;
+  data: CustomAutomationRequest | null;
+  error: string | null;
 }> {
-  const lang: Lang = input.lang === 'en' ? 'en' : 'ar';
-  const email = (input.email || '').trim().toLowerCase();
-  const businessType = (input.business_type || '').trim();
-  const businessProblem = (input.business_problem || '').trim();
-  const desiredOutcome = (input.desired_outcome || '').trim();
+  const isAr = (input.lang || 'ar') === 'ar';
 
-  if (!email || !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+  if (isHoneypotTriggered(input)) {
     return {
-      success: false,
-      message: lang === 'ar' ? 'يرجى إدخال بريد إلكتروني صحيح للتواصل.' : 'Please enter a valid email address.'
+      success: true,
+      duplicate: false,
+      message: isAr ? 'تم استلام طلبك بنجاح.' : 'Your request has been received.',
+      data: null,
+      error: null,
     };
   }
 
-  if (!businessType || businessProblem.length < 10 || desiredOutcome.length < 5) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'يرجى توضيح مجال العمل، المشكلة الحالية، والنتيجة المطلوبة بشكل كافٍ لتقييم النظام.'
-          : 'Please describe your business type, current problem, and desired outcome clearly.'
-    };
-  }
-
-  if (input.marketing_consent === false) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'يرجى الموافقة على التواصل معك لمناقشة تفاصيل طلبك.'
-          : 'Please consent to being contacted regarding your custom automation request.'
-    };
-  }
-
-  const normalizedWhatsapp = input.whatsapp_number?.trim()
-    ? normalizePhoneNumber(input.whatsapp_number.trim())
-    : '';
-
-  const toolsArray: string[] = Array.isArray(input.current_tools)
-    ? input.current_tools.map(t => String(t).trim()).filter(Boolean)
-    : typeof input.current_tools === 'string'
+  const fullName = String(input.full_name || input.name || '').trim();
+  const cleanEmail = String(input.email || '').trim().toLowerCase();
+  const cleanWhatsapp = String(input.whatsapp_number || '').trim();
+  const businessType = String(input.industry || input.business_type || input.brand_name || '').trim();
+  const businessProblem = String(input.pain_points || input.business_problem || '').trim();
+  const desiredOutcome = String(
+    input.automation_goal || input.desired_outcome || businessProblem
+  ).trim();
+  const tools = Array.isArray(input.platforms_involved)
+    ? input.platforms_involved
+    : Array.isArray(input.current_tools)
     ? input.current_tools
-        .split(',')
-        .map(t => t.trim())
-        .filter(Boolean)
     : [];
 
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) {
-    return {
-      success: false,
-      message: lang === 'ar' ? 'خدمة قاعدة البيانات غير متاحة حالياً.' : 'Database service unavailable.'
-    };
+  if (!cleanEmail || !EMAIL_REGEX.test(cleanEmail)) {
+    const msg = isAr ? 'يرجى إدخال بريد إلكتروني صحيح.' : 'Please provide a valid email address.';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  const nowIso = new Date().toISOString();
-  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-
-  // Tier 1: Try native PostgreSQL table `custom_automation_requests`
-  const { data: existingSql, error: sqlCheckErr } = await adminSb
-    .from('custom_automation_requests')
-    .select('*')
-    .eq('email', email)
-    .gte('created_at', tenMinutesAgo);
-
-  if (!sqlCheckErr) {
-    const duplicateRow = (existingSql || []).find(
-      (r: any) =>
-        (r.business_problem || '').trim().toLowerCase() === businessProblem.toLowerCase()
-    );
-
-    if (duplicateRow) {
-      return {
-        success: true,
-        duplicate: true,
-        request: duplicateRow as CustomAutomationRequest,
-        message:
-          lang === 'ar'
-            ? 'تم استلام طلبك بالفعل وهو قيد المراجعة الفنية لدى فريق ENGINITY.'
-            : 'Your request has already been received and is being reviewed by the ENGINITY team.'
-      };
-    }
-
-    const newRecord = {
-      name: (input.name || '').trim(),
-      email,
-      whatsapp_number: normalizedWhatsapp,
-      business_type: businessType,
-      business_problem: businessProblem,
-      desired_outcome: desiredOutcome,
-      current_tools: toolsArray,
-      expected_features: (input.expected_features || '').trim(),
-      budget_range: (input.budget_range || '').trim(),
-      delivery_timeframe: (input.delivery_timeframe || '').trim(),
-      additional_notes: (input.additional_notes || '').trim(),
-      marketing_consent: Boolean(input.marketing_consent),
-      status: 'new' as CustomRequestStatus,
-      estimated_quote_egp: null,
-      admin_notes: '',
-      notification_sent: false
-    };
-
-    const { data: inserted, error: insertErr } = await adminSb
-      .from('custom_automation_requests')
-      .insert(newRecord)
-      .select('*')
-      .single();
-
-    if (!insertErr && inserted) {
-      await dispatchCustomRequestNotification(adminSb, inserted as CustomAutomationRequest, 'sql');
-      return {
-        success: true,
-        duplicate: false,
-        request: inserted as CustomAutomationRequest,
-        message:
-          lang === 'ar'
-            ? 'تم استلام طلب الأتمتة المخصصة بنجاح! سيقوم فريقنا الهندسي بدراسة متطلباتك والتواصل معك قريباً.'
-            : 'Your custom automation request has been received! Our engineering team will review your requirements and contact you shortly.'
-      };
-    }
+  if (fullName.length < 2 || fullName.length > 120) {
+    const msg = isAr
+      ? 'يرجى إدخال الاسم الكامل (من حرفين إلى 120 حرفاً).'
+      : 'Please provide your full name (2 to 120 characters).';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  // Tier 2: Private RLS-protected Supabase Storage fallback (`private-crm/custom_requests.json`)
-  const list = await readPrivateJsonList<CustomAutomationRequest>(adminSb, CUSTOM_REQUESTS_FILE);
-  const existingItem = list.find(
-    item =>
-      item.email === email &&
-      item.business_problem.trim().toLowerCase() === businessProblem.toLowerCase() &&
-      item.created_at >= tenMinutesAgo
-  );
+  if (!desiredOutcome || desiredOutcome.length < 3 || desiredOutcome.length > 3000) {
+    const msg = isAr
+      ? 'يرجى توضيح المشكلة أو النتيجة المطلوبة من الأتمتة.'
+      : 'Please describe the automation problem and desired outcome.';
+    return { success: false, message: msg, data: null, error: msg };
+  }
 
-  if (existingItem) {
+  const dedupeKey = `${cleanEmail}::${businessProblem.toLowerCase()}::${desiredOutcome.toLowerCase()}`;
+  const lastSubmittedAt = recentCustomRequestFingerprints.get(dedupeKey) || 0;
+  if (Date.now() - lastSubmittedAt < 60_000) {
     return {
       success: true,
       duplicate: true,
-      request: existingItem,
-      message:
-        lang === 'ar'
-          ? 'تم استلام طلبك بالفعل وهو قيد المراجعة الفنية لدى فريق ENGINITY.'
-          : 'Your request has already been received and is being reviewed by the ENGINITY team.'
+      message: isAr
+        ? 'تم تسجيل طلبك بالفعل منذ قليل! سيتواصل معك فريقنا قريباً.'
+        : 'Your request was already submitted recently! Our team will contact you shortly.',
+      data: null,
+      error: null,
     };
   }
 
-  const record: CustomAutomationRequest = {
-    id: generateUuid(),
-    name: (input.name || '').trim(),
-    email,
-    whatsapp_number: normalizedWhatsapp,
-    business_type: businessType,
-    business_problem: businessProblem,
-    desired_outcome: desiredOutcome,
-    current_tools: toolsArray,
-    expected_features: (input.expected_features || '').trim(),
-    budget_range: (input.budget_range || '').trim(),
-    delivery_timeframe: (input.delivery_timeframe || '').trim(),
-    additional_notes: (input.additional_notes || '').trim(),
-    marketing_consent: Boolean(input.marketing_consent),
+  if (!isSupabaseConfigured()) {
+    const msg = isAr ? 'قاعدة البيانات غير متصلة.' : 'Database is not configured.';
+    return { success: false, message: msg, data: null, error: msg };
+  }
+
+  const dbPayload = {
+    name: fullName,
+    email: cleanEmail,
+    whatsapp_number: cleanWhatsapp || '',
+    business_type: businessType || 'General Business',
+    business_problem: businessProblem || desiredOutcome,
+    desired_outcome: desiredOutcome || businessProblem,
+    current_tools: tools,
+    expected_features: String(input.expected_features || input.current_workflow || '').trim(),
+    budget_range: String(input.budget_range || '').trim(),
+    delivery_timeframe: String(input.delivery_timeframe || input.timeline_urgency || '').trim(),
+    additional_notes: String(input.additional_notes || '').trim(),
+    marketing_consent: Boolean(input.marketing_consent ?? true),
     status: 'new',
-    estimated_quote_egp: null,
-    admin_notes: '',
-    notification_sent: false,
-    created_at: nowIso,
-    updated_at: nowIso
   };
 
-  list.unshift(record);
-  const saved = await writePrivateJsonList(adminSb, CUSTOM_REQUESTS_FILE, list);
-  if (!saved) {
-    return {
-      success: false,
-      message: lang === 'ar' ? 'تعذّر حفظ الطلب. يرجى المحاولة مرة أخرى.' : 'Failed to save custom request.'
-    };
+  let insertedRow: any = null;
+  const adminToken = typeof window === 'undefined' ? await getSystemAdminToken() : null;
+  if (adminToken) {
+    const authed = createAuthenticatedClient(adminToken);
+    const { data, error } = await authed
+      .from('custom_automation_requests')
+      .insert(dbPayload)
+      .select('*')
+      .maybeSingle();
+    if (error) {
+      return {
+        success: false,
+        message: error.message,
+        data: null,
+        error: error.message,
+      };
+    }
+    insertedRow = data;
+  } else {
+    const { error } = await supabase.from('custom_automation_requests').insert(dbPayload);
+    if (error) {
+      return {
+        success: false,
+        message: error.message,
+        data: null,
+        error: error.message,
+      };
+    }
   }
 
-  await dispatchCustomRequestNotification(adminSb, record, 'storage', list);
+  if (cleanEmail) {
+    recentCustomRequestFingerprints.set(dedupeKey, Date.now());
+  }
+
+  const mapped = mapDbRowToCustomRequest(
+    insertedRow || {
+      id: '',
+      ...dbPayload,
+      admin_notes: '',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }
+  );
 
   return {
     success: true,
     duplicate: false,
-    request: record,
-    message:
-      lang === 'ar'
-        ? 'تم استلام طلب الأتمتة المخصصة بنجاح! سيقوم فريقنا الهندسي بدراسة متطلباتك والتواصل معك قريباً.'
-        : 'Your custom automation request has been received! Our engineering team will review your requirements and contact you shortly.'
+    message: isAr
+      ? 'تم استلام طلب النظام المخصص بنجاح! سيتواصل معك فريقنا الهندسي قريباً.'
+      : 'Your custom automation request has been submitted! Our engineering team will contact you shortly.',
+    requestId: mapped.id || undefined,
+    request: mapped,
+    record: mapped,
+    item: mapped,
+    data: mapped,
+    error: null,
   };
 }
 
-async function dispatchCustomRequestNotification(
-  adminSb: any,
-  request: CustomAutomationRequest,
-  tier: 'sql' | 'storage',
-  storageList?: CustomAutomationRequest[]
-): Promise<void> {
-  if (request.notification_sent) return;
+export const submitCustomRequest = createCustomAutomationRequest;
 
-  try {
-    let webhookUrl = process.env.N8N_CUSTOM_REQUEST_WEBHOOK_URL || '';
-    if (!webhookUrl) {
-      const { data: settings } = await adminSb.from('settings').select('*').eq('id', 1).maybeSingle();
-      webhookUrl = settings?.social_links?.n8n_custom_request_webhook_url || '';
-    }
-
-    let notified = false;
-    if (webhookUrl) {
-      const res = await fetch(webhookUrl, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          event: 'custom_automation_requested',
-          timestamp: new Date().toISOString(),
-          request: {
-            id: request.id,
-            name: request.name,
-            email: request.email,
-            whatsapp_number: request.whatsapp_number,
-            business_type: request.business_type,
-            business_problem: request.business_problem,
-            desired_outcome: request.desired_outcome,
-            current_tools: request.current_tools,
-            budget_range: request.budget_range,
-            delivery_timeframe: request.delivery_timeframe
-          }
-        })
-      });
-      if (res.ok) notified = true;
-    }
-
-    if (notified) {
-      request.notification_sent = true;
-      if (tier === 'sql') {
-        await adminSb
-          .from('custom_automation_requests')
-          .update({ notification_sent: true })
-          .eq('id', request.id);
-      } else if (storageList) {
-        await writePrivateJsonList(adminSb, CUSTOM_REQUESTS_FILE, storageList);
-      }
-    }
-  } catch {
-    // Non-blocking notification attempt
+export async function listCustomAutomationRequests(
+  authArg?: AdminAuthArg
+): Promise<CustomAutomationRequest[]> {
+  const { client, unauthorized } = await resolveAdminSupabaseClient(authArg);
+  if (unauthorized || !client) {
+    return [];
   }
-}
 
-export async function listCustomAutomationRequests(): Promise<CustomAutomationRequest[]> {
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) return [];
-
-  const { data, error } = await adminSb
+  const { data, error } = await client
     .from('custom_automation_requests')
     .select('*')
     .order('created_at', { ascending: false });
 
-  if (!error && data) {
-    return data as CustomAutomationRequest[];
+  if (error || !data) {
+    return [];
   }
 
-  return await readPrivateJsonList<CustomAutomationRequest>(adminSb, CUSTOM_REQUESTS_FILE);
+  return data.map(mapDbRowToCustomRequest);
 }
+
+export async function fetchCustomRequests(): Promise<CustomAutomationRequest[]> {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient();
+  if (unauthorized || !client) {
+    throw new Error(error || 'Unauthorized administrator access');
+  }
+
+  const { data, error: dbError } = await client
+    .from('custom_automation_requests')
+    .select('*')
+    .order('created_at', { ascending: false });
+
+  if (dbError) {
+    throw new Error(dbError.message);
+  }
+
+  return (data || []).map(mapDbRowToCustomRequest);
+}
+
+export const fetchAdminCustomRequests = fetchCustomRequests;
 
 export async function updateCustomAutomationRequest(
   id: string,
   updates: {
     status?: CustomRequestStatus;
-    admin_notes?: string;
     estimated_quote_egp?: number | null;
-  }
-): Promise<{ success: boolean; request?: CustomAutomationRequest; message?: string }> {
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) {
-    return { success: false, message: 'Database service unavailable.' };
+    admin_notes?: string;
+  },
+  authArg?: AdminAuthArg
+): Promise<{
+  success: boolean;
+  unauthorized?: boolean;
+  request?: CustomAutomationRequest;
+  record?: CustomAutomationRequest;
+  data: CustomAutomationRequest | null;
+  error: string | null;
+}> {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient(authArg);
+  if (unauthorized || !client) {
+    return {
+      success: false,
+      unauthorized: true,
+      data: null,
+      error: error || 'Unauthorized administrator access',
+    };
   }
 
-  const nowIso = new Date().toISOString();
-  const payload: any = { updated_at: nowIso };
-  if (updates.status !== undefined) payload.status = updates.status;
-  if (updates.admin_notes !== undefined) payload.admin_notes = updates.admin_notes;
-  if (updates.estimated_quote_egp !== undefined) payload.estimated_quote_egp = updates.estimated_quote_egp;
+  const payload: Record<string, any> = {
+    updated_at: new Date().toISOString(),
+  };
 
-  const { data, error } = await adminSb
+  if (updates.status !== undefined) {
+    payload.status = normalizeDbCustomStatus(updates.status);
+  }
+  if (updates.estimated_quote_egp !== undefined) {
+    payload.estimated_quote_egp = updates.estimated_quote_egp;
+  }
+  if (updates.admin_notes !== undefined) {
+    payload.admin_notes = updates.admin_notes;
+  }
+
+  const { data, error: dbError } = await client
     .from('custom_automation_requests')
     .update(payload)
     .eq('id', id)
     .select('*')
     .single();
 
-  if (!error && data) {
-    return { success: true, request: data as CustomAutomationRequest };
+  if (dbError || !data) {
+    return {
+      success: false,
+      data: null,
+      error: dbError?.message || 'Failed to update custom automation request',
+    };
   }
 
-  const list = await readPrivateJsonList<CustomAutomationRequest>(adminSb, CUSTOM_REQUESTS_FILE);
-  const idx = list.findIndex(item => item.id === id);
-  if (idx === -1) {
-    return { success: false, message: 'Request not found.' };
-  }
-
-  list[idx] = {
-    ...list[idx],
-    ...payload
+  const mapped = mapDbRowToCustomRequest(data);
+  return {
+    success: true,
+    request: mapped,
+    record: mapped,
+    data: mapped,
+    error: null,
   };
-
-  const ok = await writePrivateJsonList(adminSb, CUSTOM_REQUESTS_FILE, list);
-  return ok
-    ? { success: true, request: list[idx] }
-    : { success: false, message: 'Failed to persist updated request.' };
 }
 
-// ============================================================================
-// FEATURE C: PRODUCT SUGGESTIONS & DEMAND VALIDATION
-// ============================================================================
+export const updateCustomRequest = updateCustomAutomationRequest;
+export const updateAdminCustomRequest = updateCustomAutomationRequest;
 
-export interface SubmitProductSuggestionInput {
+// ==========================================
+// 3. Product Suggestions & Demand Analytics (TASK-006, TASK-007)
+// ==========================================
+export interface CreateProductSuggestionInput {
   proposed_name: string;
   problem_solved: string;
-  target_audience: string;
+  target_audience?: string;
   expected_features?: string;
-  platforms_integrations?: string[] | string;
+  platforms_integrations?: string[];
   email?: string;
   whatsapp_number?: string;
-  purchase_likelihood: PurchaseLikelihood;
+  purchase_likelihood?: PurchaseLikelihood;
   preferred_price_range?: string;
   additional_context?: string;
   contact_consent?: boolean;
   lang?: Lang;
+  website_url?: string;
 }
 
+function normalizeDbPurchaseLikelihood(
+  val?: PurchaseLikelihood | string
+): 'very_likely' | 'likely' | 'not_sure' | 'unlikely' {
+  if (!val) return 'very_likely';
+  if (val === 'very_likely' || val === 'definitely') return 'very_likely';
+  if (val === 'likely' || val === 'probably') return 'likely';
+  if (val === 'not_sure' || val === 'maybe') return 'not_sure';
+  return 'unlikely';
+}
+
+function mapDbLikelihoodToUi(val?: string): PurchaseLikelihood {
+  if (val === 'definitely' || val === 'very_likely') return 'very_likely';
+  if (val === 'probably' || val === 'likely') return 'likely';
+  if (val === 'maybe' || val === 'not_sure') return 'not_sure';
+  if (val === 'just_idea' || val === 'unlikely') return 'unlikely';
+  return 'very_likely';
+}
+
+function normalizeDbSuggestionStatus(status?: ProductSuggestionStatus | string): string {
+  if (!status) return 'under_review';
+  const valid = ['under_review', 'planned', 'converted_coming_soon', 'rejected'];
+  if (valid.includes(status)) return status;
+  if (status === 'new' || status === 'reviewed') return 'under_review';
+  if (status === 'in_development' || status === 'launched') return 'converted_coming_soon';
+  return 'under_review';
+}
+
+function mapDbSuggestionStatusToUi(status?: string): ProductSuggestionStatus {
+  if (status === 'new' || status === 'reviewed' || status === 'under_review') return 'under_review';
+  if (status === 'planned') return 'planned';
+  if (
+    status === 'in_development' ||
+    status === 'launched' ||
+    status === 'converted_coming_soon'
+  ) {
+    return 'converted_coming_soon';
+  }
+  if (status === 'rejected') return 'rejected';
+  return 'under_review';
+}
+
+function mapDbRowToProductSuggestion(row: any): ProductSuggestion {
+  return {
+    id: String(row.id),
+    proposed_name: row.proposed_name || '',
+    problem_solved: row.problem_solved || '',
+    target_audience: row.target_audience || '',
+    expected_features: row.expected_features || '',
+    platforms_integrations: Array.isArray(row.platforms_integrations)
+      ? row.platforms_integrations
+      : [],
+    email: row.email || '',
+    whatsapp_number: row.whatsapp_number || '',
+    purchase_likelihood: mapDbLikelihoodToUi(row.purchase_likelihood),
+    preferred_price_range: row.preferred_price_range || '',
+    additional_context: row.additional_context || '',
+    contact_consent: Boolean(row.contact_consent),
+    fingerprint_hash: row.fingerprint_hash || '',
+    status: mapDbSuggestionStatusToUi(row.status),
+    converted_product_id: row.converted_product_id || null,
+    admin_notes: row.admin_notes || '',
+    created_at: row.created_at || new Date().toISOString(),
+    updated_at: row.updated_at || new Date().toISOString(),
+  };
+}
+
+export function buildSuggestionFingerprint(
+  proposedName: string,
+  platforms: string[] = []
+): string {
+  const normTitle = proposedName
+    .toLowerCase()
+    .replace(/[\u064B-\u065F\u0670\u0640]/g, '')
+    .replace(/[أإآٱ]/g, 'ا')
+    .replace(/ة/g, 'ه')
+    .replace(/ى/g, 'ي')
+    .replace(/[^a-z0-9\u0600-\u06FF\s]/g, ' ')
+    .replace(/\s+/g, ' ')
+    .trim();
+
+  const normPlatforms = [...platforms]
+    .map((p) => p.toLowerCase().trim())
+    .filter(Boolean)
+    .sort()
+    .join('|');
+
+  return `${normTitle}::${normPlatforms}`;
+}
+
+const recentSuggestionFingerprints = new Map<string, number>();
+
 export async function createProductSuggestion(
-  input: SubmitProductSuggestionInput
+  input: CreateProductSuggestionInput
 ): Promise<{
   success: boolean;
   duplicate?: boolean;
-  suggestion?: ProductSuggestion;
   message: string;
+  suggestionId?: string;
+  suggestion?: ProductSuggestion;
+  record?: ProductSuggestion;
+  item?: ProductSuggestion;
+  data: ProductSuggestion | null;
+  error: string | null;
 }> {
-  const lang: Lang = input.lang === 'en' ? 'en' : 'ar';
-  const proposedName = (input.proposed_name || '').trim();
-  const problemSolved = (input.problem_solved || '').trim();
-  const targetAudience = (input.target_audience || '').trim();
-  const validLikelihoods: PurchaseLikelihood[] = ['very_likely', 'likely', 'not_sure', 'unlikely'];
+  const isAr = (input.lang || 'ar') === 'ar';
 
-  if (
-    proposedName.length < 3 ||
-    problemSolved.length < 8 ||
-    targetAudience.length < 2 ||
-    !validLikelihoods.includes(input.purchase_likelihood)
-  ) {
+  if (isHoneypotTriggered(input)) {
     return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'يرجى إدخال اسم المنتج المقترح، المشكلة التي يحلها، الفئة المستهدفة، ومدى احتمالية الشراء.'
-          : 'Please provide the proposed product name, problem solved, target audience, and purchase likelihood.'
+      success: true,
+      duplicate: false,
+      message: isAr ? 'تم استلام اقتراحك بنجاح.' : 'Your suggestion has been received.',
+      data: null,
+      error: null,
     };
   }
 
-  const email = (input.email || '').trim().toLowerCase();
-  if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-    return {
-      success: false,
-      message: lang === 'ar' ? 'يرجى إدخال بريد إلكتروني صحيح.' : 'Please enter a valid email address.'
-    };
+  const proposedName = String(input.proposed_name || '').trim();
+  const problemSolved = String(input.problem_solved || '').trim();
+  const targetAudience = String(input.target_audience || '').trim();
+  const cleanEmail = String(input.email || '').trim().toLowerCase();
+
+  if (proposedName.length < 2 || proposedName.length > 200) {
+    const msg = isAr
+      ? 'يرجى إدخال اسم المنتج المقترح (من حرفين إلى 200 حرف).'
+      : 'Please enter a proposed product name (2 to 200 characters).';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  const normalizedWhatsapp = input.whatsapp_number?.trim()
-    ? normalizePhoneNumber(input.whatsapp_number.trim())
-    : '';
-
-  if (!email && !normalizedWhatsapp) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'يرجى إدخال البريد الإلكتروني أو رقم الواتساب للتواصل عند توفير المنتج.'
-          : 'Please provide an email address or WhatsApp number.'
-    };
+  if (problemSolved.length < 5 || problemSolved.length > 3000) {
+    const msg = isAr
+      ? 'يرجى شرح المشكلة التي يحلها المنتج (5 أحرف على الأقل).'
+      : 'Please describe the problem solved (at least 5 characters).';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  if (!input.contact_consent) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'يرجى الموافقة على إشعارك عند إطلاق هذا المنتج.'
-          : 'Please consent to receiving launch notifications for this suggestion.'
-    };
+  if (cleanEmail && !EMAIL_REGEX.test(cleanEmail)) {
+    const msg = isAr ? 'صيغة البريد الإلكتروني غير صحيحة.' : 'Invalid email format.';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  const integrationsArray: string[] = Array.isArray(input.platforms_integrations)
-    ? input.platforms_integrations.map(t => String(t).trim()).filter(Boolean)
-    : typeof input.platforms_integrations === 'string'
+  if (!isSupabaseConfigured()) {
+    const msg = isAr ? 'قاعدة البيانات غير متصلة.' : 'Database is not configured.';
+    return { success: false, message: msg, data: null, error: msg };
+  }
+
+  const platforms = Array.isArray(input.platforms_integrations)
     ? input.platforms_integrations
-        .split(',')
-        .map(t => t.trim())
-        .filter(Boolean)
     : [];
-
-  // Duplicate detection fingerprint: normalized contact (or problem text if anonymous) + normalized idea name
-  const contactKey = email || normalizedWhatsapp || problemSolved.slice(0, 40).toLowerCase();
-  const fingerprintHash = computeSimpleHash(`${contactKey}::${proposedName.toLowerCase()}`);
-
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) {
-    return {
-      success: false,
-      message: lang === 'ar' ? 'خدمة قاعدة البيانات غير متاحة حالياً.' : 'Database service unavailable.'
-    };
-  }
-
-  const nowIso = new Date().toISOString();
-
-  // Tier 1: Try native PostgreSQL table `product_suggestions`
-  const { data: existingSql, error: sqlCheckErr } = await adminSb
-    .from('product_suggestions')
-    .select('*')
-    .eq('fingerprint_hash', fingerprintHash);
-
-  if (!sqlCheckErr) {
-    if (existingSql && existingSql.length > 0) {
-      return {
-        success: true,
-        duplicate: true,
-        suggestion: existingSql[0] as ProductSuggestion,
-        message:
-          lang === 'ar'
-            ? 'تم تسجيل اقتراحك لهذا المنتج مسبقاً وتم احتساب صوتك في أولويات التطوير.'
-            : 'Your suggestion for this product has already been recorded in our development priorities.'
-      };
-    }
-
-    const newRow = {
-      proposed_name: proposedName,
-      problem_solved: problemSolved,
-      target_audience: targetAudience,
-      expected_features: (input.expected_features || '').trim(),
-      platforms_integrations: integrationsArray,
-      email,
-      whatsapp_number: normalizedWhatsapp,
-      purchase_likelihood: input.purchase_likelihood,
-      preferred_price_range: (input.preferred_price_range || '').trim(),
-      additional_context: (input.additional_context || '').trim(),
-      contact_consent: Boolean(input.contact_consent),
-      fingerprint_hash: fingerprintHash,
-      status: 'under_review' as ProductSuggestionStatus,
-      converted_product_id: null,
-      admin_notes: ''
-    };
-
-    const { data: inserted, error: insertErr } = await adminSb
-      .from('product_suggestions')
-      .insert(newRow)
-      .select('*')
-      .single();
-
-    if (!insertErr && inserted) {
-      return {
-        success: true,
-        duplicate: false,
-        suggestion: inserted as ProductSuggestion,
-        message:
-          lang === 'ar'
-            ? 'شكراً لمشاركتك! تم تسجيل اقتراحك بنجاح لمساعدة فريق ENGINITY في تحديد المنتجات القادمة.'
-            : 'Thank you! Your product suggestion has been recorded to help ENGINITY prioritize upcoming workflows.'
-      };
-    }
-  }
-
-  // Tier 2: Private RLS-protected Supabase Storage fallback (`private-crm/product_suggestions.json`)
-  const list = await readPrivateJsonList<ProductSuggestion>(adminSb, PRODUCT_SUGGESTIONS_FILE);
-  const existingItem = list.find(item => item.fingerprint_hash === fingerprintHash);
-
-  if (existingItem) {
+  const fingerprint_hash = buildSuggestionFingerprint(proposedName, platforms);
+  const dedupeKey = `${cleanEmail}::${fingerprint_hash}`;
+  const lastSubmittedAt = recentSuggestionFingerprints.get(dedupeKey) || 0;
+  if (cleanEmail && Date.now() - lastSubmittedAt < 60_000) {
     return {
       success: true,
       duplicate: true,
-      suggestion: existingItem,
-      message:
-        lang === 'ar'
-          ? 'تم تسجيل اقتراحك لهذا المنتج مسبقاً وتم احتساب صوتك في أولويات التطوير.'
-          : 'Your suggestion for this product has already been recorded in our development priorities.'
+      message: isAr
+        ? 'تم تسجيل هذا الاقتراح مسبقاً، شكراً لمساهمتك!'
+        : 'This suggestion was already recorded recently. Thank you!',
+      data: null,
+      error: null,
     };
   }
 
-  const record: ProductSuggestion = {
-    id: generateUuid(),
+  const dbPayload = {
     proposed_name: proposedName,
     problem_solved: problemSolved,
-    target_audience: targetAudience,
-    expected_features: (input.expected_features || '').trim(),
-    platforms_integrations: integrationsArray,
-    email,
-    whatsapp_number: normalizedWhatsapp,
-    purchase_likelihood: input.purchase_likelihood,
-    preferred_price_range: (input.preferred_price_range || '').trim(),
-    additional_context: (input.additional_context || '').trim(),
+    target_audience: targetAudience || 'General Business',
+    expected_features: String(input.expected_features || '').trim(),
+    platforms_integrations: platforms,
+    email: cleanEmail,
+    whatsapp_number: String(input.whatsapp_number || '').trim(),
+    purchase_likelihood: normalizeDbPurchaseLikelihood(input.purchase_likelihood),
+    preferred_price_range: String(input.preferred_price_range || '').trim(),
+    additional_context: String(input.additional_context || '').trim(),
     contact_consent: Boolean(input.contact_consent),
-    fingerprint_hash: fingerprintHash,
+    fingerprint_hash,
     status: 'under_review',
-    converted_product_id: null,
-    admin_notes: '',
-    created_at: nowIso,
-    updated_at: nowIso
   };
 
-  list.unshift(record);
-  const saved = await writePrivateJsonList(adminSb, PRODUCT_SUGGESTIONS_FILE, list);
-  if (!saved) {
-    return {
-      success: false,
-      message: lang === 'ar' ? 'تعذّر حفظ الاقتراح. حاول مرة أخرى.' : 'Failed to save product suggestion.'
-    };
+  let insertedRow: any = null;
+  const adminToken = typeof window === 'undefined' ? await getSystemAdminToken() : null;
+  if (adminToken) {
+    const authed = createAuthenticatedClient(adminToken);
+    const { data, error } = await authed
+      .from('product_suggestions')
+      .insert(dbPayload)
+      .select('*')
+      .maybeSingle();
+    if (error) {
+      return {
+        success: false,
+        message: error.message,
+        data: null,
+        error: error.message,
+      };
+    }
+    insertedRow = data;
+  } else {
+    const { error } = await supabase.from('product_suggestions').insert(dbPayload);
+    if (error) {
+      return {
+        success: false,
+        message: error.message,
+        data: null,
+        error: error.message,
+      };
+    }
   }
+
+  if (cleanEmail) {
+    recentSuggestionFingerprints.set(dedupeKey, Date.now());
+  }
+
+  const mapped = mapDbRowToProductSuggestion(
+    insertedRow || {
+      id: '',
+      ...dbPayload,
+      converted_product_id: null,
+      admin_notes: '',
+      created_at: new Date().toISOString(),
+      updated_at: new Date().toISOString(),
+    }
+  );
 
   return {
     success: true,
     duplicate: false,
-    suggestion: record,
-    message:
-      lang === 'ar'
-        ? 'شكراً لمشاركتك! تم تسجيل اقتراحك بنجاح لمساعدة فريق ENGINITY في تحديد المنتجات القادمة.'
-        : 'Thank you! Your product suggestion has been recorded to help ENGINITY prioritize upcoming workflows.'
+    message: isAr
+      ? 'شكراً لك! تم تسجيل اقتراحك في خارطة طريق منتجات ENGINITY.'
+      : 'Thank you! Your product suggestion has been added to the ENGINITY roadmap.',
+    suggestionId: mapped.id || undefined,
+    suggestion: mapped,
+    record: mapped,
+    item: mapped,
+    data: mapped,
+    error: null,
   };
 }
 
-export async function listProductSuggestions(): Promise<ProductSuggestion[]> {
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) return [];
+export const submitProductSuggestion = createProductSuggestion;
 
-  const { data, error } = await adminSb
+export async function listProductSuggestions(
+  authArg?: AdminAuthArg
+): Promise<ProductSuggestion[]> {
+  const { client, unauthorized } = await resolveAdminSupabaseClient(authArg);
+  if (unauthorized || !client) {
+    return [];
+  }
+
+  const { data, error } = await client
     .from('product_suggestions')
     .select('*')
     .order('created_at', { ascending: false });
 
-  if (!error && data) {
-    return data as ProductSuggestion[];
+  if (error || !data) {
+    return [];
   }
 
-  return await readPrivateJsonList<ProductSuggestion>(adminSb, PRODUCT_SUGGESTIONS_FILE);
+  return data.map(mapDbRowToProductSuggestion);
 }
+
+export function computeDemandAnalytics(
+  suggestions: ProductSuggestion[]
+): DemandAnalyticsSummary {
+  const total_submissions = suggestions.length;
+  const intent_distribution: Record<PurchaseLikelihood, number> = {
+    very_likely: 0,
+    likely: 0,
+    not_sure: 0,
+    unlikely: 0,
+  };
+
+  const uniqueContacts = new Set<string>();
+  const platformCounts = new Map<string, number>();
+  const ideaGroups = new Map<
+    string,
+    {
+      fingerprint: string;
+      representative_name: string;
+      problem_summary: string;
+      submission_count: number;
+      high_intent_count: number;
+      integrations: Set<string>;
+      latest_status: ProductSuggestionStatus;
+      suggestion_ids: string[];
+    }
+  >();
+
+  for (const s of suggestions) {
+    const likelihood = mapDbLikelihoodToUi(s.purchase_likelihood);
+    intent_distribution[likelihood] = (intent_distribution[likelihood] || 0) + 1;
+
+    const contactKey = (s.email || s.whatsapp_number || '').trim().toLowerCase();
+    if (contactKey) {
+      uniqueContacts.add(contactKey);
+    }
+
+    for (const p of s.platforms_integrations || []) {
+      const cleanP = p.trim();
+      if (cleanP) {
+        platformCounts.set(cleanP, (platformCounts.get(cleanP) || 0) + 1);
+      }
+    }
+
+    const fp =
+      s.fingerprint_hash ||
+      buildSuggestionFingerprint(s.proposed_name, s.platforms_integrations);
+    const isHighIntent = likelihood === 'very_likely' || likelihood === 'likely';
+
+    const existing = ideaGroups.get(fp);
+    if (!existing) {
+      ideaGroups.set(fp, {
+        fingerprint: fp,
+        representative_name: s.proposed_name,
+        problem_summary: s.problem_solved,
+        submission_count: 1,
+        high_intent_count: isHighIntent ? 1 : 0,
+        integrations: new Set(s.platforms_integrations || []),
+        latest_status: s.status || 'under_review',
+        suggestion_ids: s.id ? [s.id] : [],
+      });
+    } else {
+      existing.submission_count += 1;
+      if (isHighIntent) {
+        existing.high_intent_count += 1;
+      }
+      for (const p of s.platforms_integrations || []) {
+        existing.integrations.add(p);
+      }
+      if (s.id) {
+        existing.suggestion_ids.push(s.id);
+      }
+    }
+  }
+
+  const top_integrations = Array.from(platformCounts.entries())
+    .map(([name, count]) => ({ name, count }))
+    .sort((a, b) => b.count - a.count)
+    .slice(0, 8);
+
+  const top_ideas = Array.from(ideaGroups.values())
+    .map((g) => {
+      const integrationsList = Array.from(g.integrations);
+      return {
+        fingerprint: g.fingerprint,
+        normalized_title: g.fingerprint.split('::')[0] || g.representative_name,
+        display_name: g.representative_name,
+        representative_name: g.representative_name,
+        problem_summary: g.problem_summary,
+        submission_count: g.submission_count,
+        submissions_count: g.submission_count,
+        distinct_contacts_count: g.submission_count,
+        high_intent_count: g.high_intent_count,
+        integrations: integrationsList,
+        top_integrations: integrationsList,
+        latest_status: g.latest_status,
+        status: g.latest_status,
+        suggestion_ids: g.suggestion_ids,
+      };
+    })
+    .sort(
+      (a, b) =>
+        b.submission_count - a.submission_count ||
+        b.high_intent_count - a.high_intent_count
+    )
+    .slice(0, 10);
+
+  return {
+    total_submissions,
+    distinct_contacts: uniqueContacts.size,
+    intent_distribution,
+    top_integrations,
+    top_ideas,
+  };
+}
+
+export async function fetchAdminProductSuggestions(): Promise<{
+  suggestions: ProductSuggestion[];
+  analytics: DemandAnalyticsSummary;
+}> {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient();
+  if (unauthorized || !client) {
+    throw new Error(error || 'Unauthorized administrator access');
+  }
+
+  const { data, error: dbError } = await client
+    .from('product_suggestions')
+    .select('*')
+    .order('created_at', { ascending: false });
+
+  if (dbError) {
+    throw new Error(dbError.message);
+  }
+
+  const suggestions = (data || []).map(mapDbRowToProductSuggestion);
+  return {
+    suggestions,
+    analytics: computeDemandAnalytics(suggestions),
+  };
+}
+
+export const fetchProductSuggestions = fetchAdminProductSuggestions;
 
 export async function updateProductSuggestion(
   id: string,
@@ -675,787 +1069,498 @@ export async function updateProductSuggestion(
     status?: ProductSuggestionStatus;
     admin_notes?: string;
     converted_product_id?: string | null;
-  }
-): Promise<{ success: boolean; suggestion?: ProductSuggestion; message?: string }> {
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) {
-    return { success: false, message: 'Database service unavailable.' };
+  },
+  authArg?: AdminAuthArg
+): Promise<{
+  success: boolean;
+  unauthorized?: boolean;
+  suggestion?: ProductSuggestion;
+  record?: ProductSuggestion;
+  data: ProductSuggestion | null;
+  error: string | null;
+}> {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient(authArg);
+  if (unauthorized || !client) {
+    return {
+      success: false,
+      unauthorized: true,
+      data: null,
+      error: error || 'Unauthorized administrator access',
+    };
   }
 
-  const nowIso = new Date().toISOString();
-  const payload: any = { updated_at: nowIso };
-  if (updates.status !== undefined) payload.status = updates.status;
-  if (updates.admin_notes !== undefined) payload.admin_notes = updates.admin_notes;
-  if (updates.converted_product_id !== undefined) payload.converted_product_id = updates.converted_product_id;
+  const payload: Record<string, any> = {
+    updated_at: new Date().toISOString(),
+  };
 
-  const { data, error } = await adminSb
+  if (updates.status !== undefined) {
+    payload.status = normalizeDbSuggestionStatus(updates.status);
+  }
+  if (updates.admin_notes !== undefined) {
+    payload.admin_notes = updates.admin_notes;
+  }
+  if (updates.converted_product_id !== undefined) {
+    payload.converted_product_id = updates.converted_product_id;
+  }
+
+  const { data, error: dbError } = await client
     .from('product_suggestions')
     .update(payload)
     .eq('id', id)
     .select('*')
     .single();
 
-  if (!error && data) {
-    return { success: true, suggestion: data as ProductSuggestion };
+  if (dbError || !data) {
+    return {
+      success: false,
+      data: null,
+      error: dbError?.message || 'Failed to update product suggestion',
+    };
   }
 
-  const list = await readPrivateJsonList<ProductSuggestion>(adminSb, PRODUCT_SUGGESTIONS_FILE);
-  const idx = list.findIndex(item => item.id === id);
-  if (idx === -1) {
-    return { success: false, message: 'Suggestion not found.' };
+  const mapped = mapDbRowToProductSuggestion(data);
+  if (updates.status) {
+    mapped.status = updates.status;
   }
-
-  list[idx] = {
-    ...list[idx],
-    ...payload
-  };
-
-  const ok = await writePrivateJsonList(adminSb, PRODUCT_SUGGESTIONS_FILE, list);
-  return ok
-    ? { success: true, suggestion: list[idx] }
-    : { success: false, message: 'Failed to persist updated suggestion.' };
-}
-
-export function computeDemandAnalytics(suggestions: ProductSuggestion[]): DemandAnalyticsSummary {
-  const intentDistribution = {
-    very_likely: 0,
-    likely: 0,
-    not_sure: 0,
-    unlikely: 0
-  };
-
-  const contactSet = new Set<string>();
-  const integrationCounts = new Map<string, number>();
-  const ideaMap = new Map<
-    string,
-    {
-      display_name: string;
-      submissions_count: number;
-      contacts: Set<string>;
-      high_intent_count: number;
-      integrations: Map<string, number>;
-      latest_submission_at: string;
-      sample_problem: string;
-      target_audience: string;
-      suggestion_ids: string[];
-      status: ProductSuggestionStatus;
-    }
-  >();
-
-  for (const s of suggestions) {
-    if (s.purchase_likelihood in intentDistribution) {
-      intentDistribution[s.purchase_likelihood] += 1;
-    }
-
-    const contactId =
-      (s.email && s.email.trim().toLowerCase()) ||
-      (s.whatsapp_number && s.whatsapp_number.trim()) ||
-      `anon_${s.id}`;
-    contactSet.add(contactId);
-
-    for (const rawTool of s.platforms_integrations || []) {
-      const cleanTool = rawTool.trim();
-      if (!cleanTool) continue;
-      integrationCounts.set(cleanTool, (integrationCounts.get(cleanTool) || 0) + 1);
-    }
-
-    const normalizedKey = s.proposed_name
-      .trim()
-      .toLowerCase()
-      .replace(/[^\p{L}\p{N}\s]/gu, '')
-      .replace(/\s+/g, ' ');
-
-    const isHighIntent = s.purchase_likelihood === 'very_likely' || s.purchase_likelihood === 'likely';
-
-    const existingGroup = ideaMap.get(normalizedKey);
-    if (!existingGroup) {
-      const toolMap = new Map<string, number>();
-      for (const t of s.platforms_integrations || []) {
-        if (t.trim()) toolMap.set(t.trim(), 1);
-      }
-      ideaMap.set(normalizedKey, {
-        display_name: s.proposed_name.trim(),
-        submissions_count: 1,
-        contacts: new Set([contactId]),
-        high_intent_count: isHighIntent ? 1 : 0,
-        integrations: toolMap,
-        latest_submission_at: s.created_at,
-        sample_problem: s.problem_solved,
-        target_audience: s.target_audience,
-        suggestion_ids: [s.id],
-        status: s.status
-      });
-    } else {
-      existingGroup.submissions_count += 1;
-      existingGroup.contacts.add(contactId);
-      if (isHighIntent) existingGroup.high_intent_count += 1;
-      for (const t of s.platforms_integrations || []) {
-        if (t.trim()) {
-          existingGroup.integrations.set(t.trim(), (existingGroup.integrations.get(t.trim()) || 0) + 1);
-        }
-      }
-      if (s.created_at > existingGroup.latest_submission_at) {
-        existingGroup.latest_submission_at = s.created_at;
-      }
-      existingGroup.suggestion_ids.push(s.id);
-    }
-  }
-
-  const topIntegrations = Array.from(integrationCounts.entries())
-    .map(([name, count]) => ({ name, count }))
-    .sort((a, b) => b.count - a.count)
-    .slice(0, 10);
-
-  const topIdeas: DemandIdeaGroup[] = Array.from(ideaMap.entries())
-    .map(([normalized_title, group]) => ({
-      normalized_title,
-      display_name: group.display_name,
-      submissions_count: group.submissions_count,
-      distinct_contacts_count: group.contacts.size,
-      high_intent_count: group.high_intent_count,
-      top_integrations: Array.from(group.integrations.entries())
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 5)
-        .map(e => e[0]),
-      latest_submission_at: group.latest_submission_at,
-      sample_problem: group.sample_problem,
-      target_audience: group.target_audience,
-      suggestion_ids: group.suggestion_ids,
-      status: group.status
-    }))
-    .sort((a, b) => {
-      if (b.high_intent_count !== a.high_intent_count) return b.high_intent_count - a.high_intent_count;
-      return b.submissions_count - a.submissions_count;
-    });
 
   return {
-    total_submissions: suggestions.length,
-    distinct_contacts: contactSet.size,
-    intent_distribution: intentDistribution,
-    top_integrations: topIntegrations,
-    top_ideas: topIdeas
+    success: true,
+    suggestion: mapped,
+    record: mapped,
+    data: mapped,
+    error: null,
   };
 }
 
-export async function cleanupSyntheticTestRecords(): Promise<void> {
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) return;
+export const updateAdminProductSuggestion = updateProductSuggestion;
 
-  // Clean SQL tables if present
-  try {
-    await adminSb
-      .from('custom_automation_requests')
-      .delete()
-      .ilike('email', '%@enginity.test');
-    await adminSb
-      .from('product_suggestions')
-      .delete()
-      .ilike('email', '%@enginity.test');
-    await adminSb
-      .from('product_reviews')
-      .delete()
-      .ilike('customer_name', '%[TEST_SYNTHETIC]%');
-  } catch {
-    // Ignore if SQL tables not created yet
-  }
+// ==========================================
+// 4. Product Ratings & Customer Reviews (TASK-006, TASK-007)
+// ==========================================
+export const calculateRatingSummary = computeProductRatingSummary;
 
-  // Clean storage fallback files
-  const reqs = await readPrivateJsonList<CustomAutomationRequest>(adminSb, CUSTOM_REQUESTS_FILE);
-  const cleanedReqs = reqs.filter(r => !r.email.endsWith('@enginity.test'));
-  await writePrivateJsonList(adminSb, CUSTOM_REQUESTS_FILE, cleanedReqs);
-
-  const sugs = await readPrivateJsonList<ProductSuggestion>(adminSb, PRODUCT_SUGGESTIONS_FILE);
-  const cleanedSugs = sugs.filter(s => !(s.email && s.email.endsWith('@enginity.test')));
-  await writePrivateJsonList(adminSb, PRODUCT_SUGGESTIONS_FILE, cleanedSugs);
-
-  const revs = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
-  const cleanedRevs = revs.filter(r => !r.customer_name.includes('[TEST_SYNTHETIC]'));
-  await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, cleanedRevs);
-}
-
-// ============================================================================
-// FEATURE D: PRODUCT RATINGS & CUSTOMER REVIEWS (WITH MODERATION)
-// ============================================================================
-
-export interface SubmitProductReviewInput {
+export interface CreateProductReviewInput {
   product_id: string;
   customer_name: string;
   rating: number;
   review_text?: string | null;
   lang?: Lang;
-  // Any client-supplied status is ignored to prevent privilege escalation
-  status?: any;
-}
-
-const UUID_REGEX = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
-
-export async function verifyAdminCallerAuthorization(options?: {
-  token?: string;
-  isServerAuthorized?: boolean;
-  requireAuthCheck?: boolean;
-}): Promise<boolean> {
-  if (options?.isServerAuthorized === true) {
-    return true;
-  }
-
-  const requireAuth = options?.requireAuthCheck ?? false;
-  let token = options?.token || '';
-
-  if (!token && typeof window !== 'undefined') {
-    try {
-      token = localStorage.getItem('enginity_sb_token') || '';
-    } catch {
-      // ignore
-    }
-  }
-
-  if (token) {
-    const client = getSupabaseAdmin(token);
-    if (client) {
-      try {
-        const { data: userData, error: userErr } = await client.auth.getUser(token);
-        if (!userErr && userData?.user) {
-          const { data: adminRow, error: adminErr } = await client
-            .from('admins')
-            .select('user_id')
-            .eq('user_id', userData.user.id)
-            .single();
-          if (!adminErr && adminRow) return true;
-        }
-      } catch {
-        // invalid token
-      }
-    }
-    return false;
-  }
-
-  if (typeof window !== 'undefined' && supabase) {
-    try {
-      const { data: sessionData } = await supabase.auth.getSession();
-      const user = sessionData?.session?.user;
-      if (user) {
-        const { data: adminRow, error: adminErr } = await supabase
-          .from('admins')
-          .select('user_id')
-          .eq('user_id', user.id)
-          .single();
-        if (!adminErr && adminRow) return true;
-      }
-    } catch {
-      // ignore
-    }
-  }
-
-  if (requireAuth) {
-    return false;
-  }
-
-  return false;
+  website_url?: string;
 }
 
 export async function createProductReview(
-  input: SubmitProductReviewInput
+  input: CreateProductReviewInput
 ): Promise<{
   success: boolean;
-  duplicate?: boolean;
-  review?: ProductReview;
   message: string;
+  review?: ProductReview;
+  data: ProductReview | null;
+  error: string | null;
 }> {
-  const lang: Lang = input.lang === 'en' ? 'en' : 'ar';
+  const isAr = (input.lang || 'ar') === 'ar';
+
+  if (isHoneypotTriggered(input)) {
+    return {
+      success: true,
+      message: isAr ? 'تم استلام تقييمك بنجاح.' : 'Your review has been submitted.',
+      data: null,
+      error: null,
+    };
+  }
+
   const productId = String(input.product_id || '').trim();
   const customerName = String(input.customer_name || '').trim();
-  const rawRating = Number(input.rating);
-  const reviewText =
+  const rating = Number(input.rating);
+  const rawReviewText =
     input.review_text !== undefined && input.review_text !== null
       ? String(input.review_text).trim()
-      : '';
+      : null;
 
-  if (!productId || !UUID_REGEX.test(productId)) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'معرّف المنتج غير صالح.'
-          : 'Invalid product identifier.'
-    };
+  if (!productId) {
+    const msg = isAr ? 'معرف المنتج مطلوب.' : 'Product ID is required.';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
   if (customerName.length < 2 || customerName.length > 100) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'يرجى إدخال اسمك بشكل صحيح (من حرفين إلى 100 حرف).'
-          : 'Please enter a valid customer name (2 to 100 characters).'
-    };
+    const msg = isAr
+      ? 'يرجى إدخال الاسم (من حرفين إلى 100 حرف).'
+      : 'Customer name must be between 2 and 100 characters.';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  if (!Number.isInteger(rawRating) || rawRating < 1 || rawRating > 5) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'يرجى اختيار تقييم صحيح بين نجمة واحدة و5 نجوم.'
-          : 'Please select a valid star rating between 1 and 5.'
-    };
+  if (!Number.isInteger(rating) || rating < 1 || rating > 5) {
+    const msg = isAr
+      ? 'التقييم يجب أن يكون رقماً صحيحاً بين 1 و 5 نجوم.'
+      : 'Rating must be an integer between 1 and 5.';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  if (reviewText.length > 2000) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'نص التقييم طويل جداً (الحد الأقصى 2000 حرف).'
-          : 'Review text is too long (maximum 2000 characters).'
-    };
+  if (rawReviewText !== null && rawReviewText.length > 2000) {
+    const msg = isAr
+      ? 'نص المراجعة يجب ألا يتجاوز 2000 حرف.'
+      : 'Review text must not exceed 2000 characters.';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'تعذر الاتصال بقاعدة البيانات حالياً. يرجى المحاولة لاحقاً.'
-          : 'Database connection unavailable. Please try again later.'
-    };
+  if (!isSupabaseConfigured()) {
+    const msg = isAr ? 'قاعدة البيانات غير متصلة.' : 'Database is not configured.';
+    return { success: false, message: msg, data: null, error: msg };
   }
 
-  // Verify product exists in public.products
-  try {
-    const { data: prodRow, error: prodErr } = await adminSb
-      .from('products')
-      .select('id, status')
-      .eq('id', productId)
-      .maybeSingle();
-
-    if (!prodErr && !prodRow) {
-      return {
-        success: false,
-        message:
-          lang === 'ar'
-            ? 'المنتج المطلوب تقييمه غير موجود.'
-            : 'The specified product does not exist.'
-      };
-    }
-  } catch {
-    // Allow proceeding if products lookup encounters transient error
-  }
-
-  const nowIso = new Date().toISOString();
-  const tenMinutesAgo = new Date(Date.now() - 10 * 60 * 1000).toISOString();
-
-  // Enforce status = 'pending' regardless of client payload
-  const forcedStatus: ProductReviewStatus = 'pending';
-
-  // Tier 1: Try native SQL table `product_reviews`
-  const { data: existingSql, error: checkSqlErr } = await adminSb
-    .from('product_reviews')
-    .select('*')
-    .eq('product_id', productId)
-    .gte('created_at', tenMinutesAgo);
-
-  if (!checkSqlErr && existingSql) {
-    const dup = existingSql.find(
-      (r: any) =>
-        String(r.customer_name || '').trim().toLowerCase() === customerName.toLowerCase() &&
-        Number(r.rating) === rawRating &&
-        String(r.review_text || '').trim() === reviewText
-    );
-    if (dup) {
-      return {
-        success: true,
-        duplicate: true,
-        review: dup as ProductReview,
-        message:
-          lang === 'ar'
-            ? 'تم استلام تقييمك بالفعل وهو قيد المراجعة حالياً. شكراً لمشاركتك!'
-            : 'Your review has already been received and is pending moderation. Thank you!'
-      };
-    }
-
-    const { data: insertedSql, error: insertSqlErr } = await adminSb
-      .from('product_reviews')
-      .insert({
-        product_id: productId,
-        customer_name: customerName,
-        rating: rawRating,
-        review_text: reviewText || null,
-        status: forcedStatus
-      })
-      .select('*')
-      .single();
-
-    if (!insertSqlErr && insertedSql) {
-      // Also mirror into storage list for consistency
-      const list = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
-      list.unshift(insertedSql as ProductReview);
-      await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, list);
-
-      return {
-        success: true,
-        duplicate: false,
-        review: insertedSql as ProductReview,
-        message:
-          lang === 'ar'
-            ? 'شكراً لتقييمك! تم إرسال مراجعتك بنجاح وستظهر على صفحة المنتج فور اعتمادها من الإدارة.'
-            : 'Thank you for your review! It has been submitted and will appear once approved by our team.'
-      };
-    }
-  }
-
-  // Tier 2: Private CRM Storage fallback if SQL table `product_reviews` is not yet created
-  const list = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
-  const dupStorage = list.find(
-    r =>
-      r.product_id === productId &&
-      r.customer_name.trim().toLowerCase() === customerName.toLowerCase() &&
-      r.rating === rawRating &&
-      String(r.review_text || '').trim() === reviewText &&
-      r.created_at >= tenMinutesAgo
-  );
-
-  if (dupStorage) {
-    return {
-      success: true,
-      duplicate: true,
-      review: dupStorage,
-      message:
-        lang === 'ar'
-          ? 'تم استلام تقييمك بالفعل وهو قيد المراجعة حالياً. شكراً لمشاركتك!'
-          : 'Your review has already been received and is pending moderation. Thank you!'
-    };
-  }
-
-  const record: ProductReview = {
-    id: generateUuid(),
+  const dbPayload = {
     product_id: productId,
     customer_name: customerName,
-    rating: rawRating,
-    review_text: reviewText || null,
-    status: forcedStatus,
-    created_at: nowIso,
-    updated_at: nowIso
+    rating,
+    review_text: rawReviewText && rawReviewText.length > 0 ? rawReviewText : null,
+    status: 'pending' as ProductReviewStatus,
   };
 
-  list.unshift(record);
-  const saved = await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, list);
-  if (!saved) {
-    return {
-      success: false,
-      message:
-        lang === 'ar'
-          ? 'تعذّر حفظ التقييم حالياً. يرجى المحاولة مرة أخرى.'
-          : 'Failed to save your review. Please try again.'
-    };
+  let insertedRow: any = null;
+  const adminToken = typeof window === 'undefined' ? await getSystemAdminToken() : null;
+  if (adminToken) {
+    const authed = createAuthenticatedClient(adminToken);
+    const { data, error } = await authed
+      .from('product_reviews')
+      .insert(dbPayload)
+      .select('*')
+      .maybeSingle();
+    if (error) {
+      return {
+        success: false,
+        message: error.message,
+        data: null,
+        error: error.message,
+      };
+    }
+    insertedRow = data;
+  } else {
+    const { error } = await supabase.from('product_reviews').insert(dbPayload);
+    if (error) {
+      return {
+        success: false,
+        message: error.message,
+        data: null,
+        error: error.message,
+      };
+    }
   }
+
+  const now = new Date().toISOString();
+  const createdReview: ProductReview = {
+    id: insertedRow?.id ? String(insertedRow.id) : '',
+    product_id: productId,
+    customer_name: customerName,
+    rating,
+    review_text: dbPayload.review_text,
+    status: 'pending',
+    created_at: insertedRow?.created_at || now,
+    updated_at: insertedRow?.updated_at || now,
+  };
 
   return {
     success: true,
-    duplicate: false,
-    review: record,
-    message:
-      lang === 'ar'
-        ? 'شكراً لتقييمك! تم إرسال مراجعتك بنجاح وستظهر على صفحة المنتج فور اعتمادها من الإدارة.'
-        : 'Thank you for your review! It has been submitted and will appear once approved by our team.'
+    message: isAr
+      ? 'شكراً لتقييمك! تم استلام مراجعتك وستظهر في صفحة المنتج فور اعتمادها.'
+      : 'Thank you for your review! It has been submitted and will appear once approved.',
+    review: createdReview,
+    data: createdReview,
+    error: null,
   };
 }
 
-/**
- * Public read: returns ONLY approved reviews (`status === 'approved'`) for a product (or all products if productId omitted).
- * Pending and rejected reviews are strictly excluded.
- */
-export async function listApprovedProductReviews(productId?: string): Promise<ProductReview[]> {
-  if (productId && !UUID_REGEX.test(productId.trim())) {
-    return [];
-  }
-
-  // Try public/system Supabase SQL query first
-  const client = supabase || (await getSystemAdminSupabase());
-  if (client) {
-    let query = client
-      .from('product_reviews')
-      .select('*')
-      .eq('status', 'approved')
-      .order('created_at', { ascending: false });
-
-    if (productId) {
-      query = query.eq('product_id', productId.trim());
-    }
-
-    const { data, error } = await query;
-    if (!error && Array.isArray(data)) {
-      return (data as ProductReview[]).filter(
-        r =>
-          r.status === 'approved' &&
-          typeof r.rating === 'number' &&
-          r.rating >= 1 &&
-          r.rating <= 5 &&
-          (!productId || r.product_id === productId.trim())
-      );
-    }
-  }
-
-  // Fallback to Private Storage filtered strictly to status === 'approved'
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) return [];
-
-  const allReviews = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
-  return allReviews
-    .filter(
-      r =>
-        r &&
-        r.status === 'approved' &&
-        typeof r.rating === 'number' &&
-        r.rating >= 1 &&
-        r.rating <= 5 &&
-        (!productId || r.product_id === productId.trim())
-    )
-    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-}
+export const submitProductReview = createProductReview;
 
 export async function getProductReviewsAndSummary(productId: string): Promise<{
   reviews: ProductReview[];
   summary: ProductRatingSummary;
 }> {
-  const approvedReviews = await listApprovedProductReviews(productId);
-  const summary = computeProductRatingSummary(productId, approvedReviews);
+  if (!productId || !isSupabaseConfigured()) {
+    return {
+      reviews: [],
+      summary: computeProductRatingSummary(productId, []),
+    };
+  }
+
+  const { data, error } = await supabase
+    .from('product_reviews')
+    .select('id, product_id, customer_name, rating, review_text, status, created_at, updated_at')
+    .eq('product_id', productId)
+    .eq('status', 'approved')
+    .order('created_at', { ascending: false });
+
+  if (error || !data) {
+    return {
+      reviews: [],
+      summary: computeProductRatingSummary(productId, []),
+    };
+  }
+
+  const reviews = data as ProductReview[];
   return {
-    reviews: approvedReviews,
-    summary
+    reviews,
+    summary: computeProductRatingSummary(productId, reviews),
   };
 }
 
-/**
- * Admin read: returns all reviews (pending, approved, rejected), optionally filtered by status or productId.
- * Enforces admin authorization when requireAuthCheck is true.
- */
-export async function listAdminProductReviews(options?: {
-  status?: ProductReviewStatus | 'all';
-  productId?: string;
-  token?: string;
-  isServerAuthorized?: boolean;
-  requireAuthCheck?: boolean;
-}): Promise<{
+export const fetchProductReviews = getProductReviewsAndSummary;
+
+export async function fetchApprovedProductReviews(productId: string): Promise<ProductReview[]> {
+  const { reviews } = await getProductReviewsAndSummary(productId);
+  return reviews;
+}
+
+export async function fetchAllApprovedRatingSummaries(): Promise<
+  Record<string, ProductRatingSummary>
+> {
+  if (!isSupabaseConfigured()) {
+    return {};
+  }
+
+  const { data, error } = await supabase
+    .from('product_reviews')
+    .select('product_id, rating, status')
+    .eq('status', 'approved');
+
+  if (error || !data) {
+    return {};
+  }
+
+  const grouped = new Map<
+    string,
+    Array<{ product_id: string; rating: number; status: ProductReviewStatus }>
+  >();
+  for (const row of data as any[]) {
+    const pid = String(row.product_id);
+    if (!grouped.has(pid)) {
+      grouped.set(pid, []);
+    }
+    grouped.get(pid)!.push(row);
+  }
+
+  const summaries: Record<string, ProductRatingSummary> = {};
+  for (const [pid, rows] of grouped.entries()) {
+    summaries[pid] = computeProductRatingSummary(pid, rows);
+  }
+
+  return summaries;
+}
+
+export const fetchApprovedRatingSummaries = fetchAllApprovedRatingSummaries;
+
+export type AdminReviewsListResult = ProductReview[] & {
   success: boolean;
   unauthorized?: boolean;
   reviews: ProductReview[];
-  message?: string;
-}> {
-  if (options?.requireAuthCheck) {
-    const authorized = await verifyAdminCallerAuthorization(options);
-    if (!authorized) {
-      return {
-        success: false,
-        unauthorized: true,
-        reviews: [],
-        message: 'غير مصرح لك بعرض تقييمات الإدارة (Admin Only).'
-      };
-    }
-  }
+};
 
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) {
-    return { success: false, reviews: [], message: 'تعذر الاتصال بقاعدة البيانات.' };
-  }
-
-  let reviewsList: ProductReview[] = [];
-
-  const { data, error } = await adminSb
-    .from('product_reviews')
-    .select('*')
-    .order('created_at', { ascending: false });
-
-  if (!error && Array.isArray(data)) {
-    reviewsList = data as ProductReview[];
-  } else {
-    reviewsList = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
-  }
-
-  const statusFilter = options?.status && options.status !== 'all' ? options.status : null;
-  const productFilter = options?.productId?.trim() || null;
-
-  const filtered = reviewsList
-    .filter(r => {
-      if (!r || !r.id) return false;
-      if (statusFilter && r.status !== statusFilter) return false;
-      if (productFilter && r.product_id !== productFilter) return false;
-      return true;
-    })
-    .sort((a, b) => (b.created_at || '').localeCompare(a.created_at || ''));
-
-  return {
-    success: true,
-    reviews: filtered
-  };
+function attachReviewsResultMeta(
+  items: ProductReview[],
+  meta: { success: boolean; unauthorized?: boolean }
+): AdminReviewsListResult {
+  const arr = [...items] as AdminReviewsListResult;
+  arr.success = meta.success;
+  arr.unauthorized = meta.unauthorized;
+  arr.reviews = items;
+  return arr;
 }
 
-/**
- * Admin moderation: approves or rejects a review.
- * Enforces admin authorization when requireAuthCheck is true.
- */
+export async function listAdminProductReviews(
+  authArg?: AdminAuthArg
+): Promise<AdminReviewsListResult> {
+  const { client, unauthorized } = await resolveAdminSupabaseClient(authArg);
+  if (unauthorized || !client) {
+    return attachReviewsResultMeta([], { success: false, unauthorized: true });
+  }
+
+  const { data, error } = await client
+    .from('product_reviews')
+    .select('*, product:products(id, slug, name_ar, name_en, cover_path)')
+    .order('created_at', { ascending: false });
+
+  if (error || !data) {
+    return attachReviewsResultMeta([], { success: false });
+  }
+
+  return attachReviewsResultMeta(data as ProductReview[], { success: true });
+}
+
+export async function fetchAdminReviews(): Promise<ProductReview[]> {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient();
+  if (unauthorized || !client) {
+    throw new Error(error || 'Unauthorized administrator access');
+  }
+
+  const { data, error: dbError } = await client
+    .from('product_reviews')
+    .select('*, product:products(id, slug, name_ar, name_en, cover_path)')
+    .order('created_at', { ascending: false });
+
+  if (dbError) {
+    throw new Error(dbError.message);
+  }
+
+  return (data || []) as ProductReview[];
+}
+
+export const fetchAllProductReviewsAdmin = fetchAdminReviews;
+
 export async function moderateProductReview(
   id: string,
   status: ProductReviewStatus,
-  options?: {
-    token?: string;
-    isServerAuthorized?: boolean;
-    requireAuthCheck?: boolean;
-  }
+  authArg?: AdminAuthArg
 ): Promise<{
   success: boolean;
   unauthorized?: boolean;
+  message: string;
   review?: ProductReview;
-  message?: string;
+  data: ProductReview | null;
+  error: string | null;
 }> {
-  if (options?.requireAuthCheck) {
-    const authorized = await verifyAdminCallerAuthorization(options);
-    if (!authorized) {
-      return {
-        success: false,
-        unauthorized: true,
-        message: 'غير مصرح لك بتعديل حالة التقييم (Admin Only).'
-      };
-    }
-  }
-
-  const validStatuses: ProductReviewStatus[] = ['pending', 'approved', 'rejected'];
-  if (!validStatuses.includes(status)) {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient(authArg);
+  if (unauthorized || !client) {
+    const msg = error || 'Unauthorized administrator access';
     return {
       success: false,
-      message: 'حالة التقييم غير صالحة.'
+      unauthorized: true,
+      message: msg,
+      data: null,
+      error: msg,
     };
   }
 
-  const reviewId = String(id || '').trim();
-  if (!reviewId) {
-    return {
-      success: false,
-      message: 'معرّف التقييم مطلوب.'
-    };
-  }
-
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) {
-    return { success: false, message: 'تعذر الاتصال بقاعدة البيانات.' };
-  }
-
-  const nowIso = new Date().toISOString();
-  let updatedRecord: ProductReview | undefined;
-
-  // Try updating SQL table if present
-  const { data: sqlData, error: sqlErr } = await adminSb
+  const { data, error: dbError } = await client
     .from('product_reviews')
-    .update({ status, updated_at: nowIso })
-    .eq('id', reviewId)
-    .select('*')
+    .update({ status, updated_at: new Date().toISOString() })
+    .eq('id', id)
+    .select('*, product:products(id, slug, name_ar, name_en, cover_path)')
     .single();
 
-  if (!sqlErr && sqlData) {
-    updatedRecord = sqlData as ProductReview;
-  }
-
-  // Also update storage fallback list
-  const list = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
-  const idx = list.findIndex(r => r.id === reviewId);
-  if (idx !== -1) {
-    list[idx] = {
-      ...list[idx],
-      status,
-      updated_at: nowIso
-    };
-    await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, list);
-    if (!updatedRecord) {
-      updatedRecord = list[idx];
-    }
-  }
-
-  if (!updatedRecord) {
+  if (dbError || !data) {
+    const msg = dbError?.message || 'Failed to update review status';
     return {
       success: false,
-      message: 'التقييم غير موجود.'
+      message: msg,
+      data: null,
+      error: msg,
     };
   }
 
   return {
     success: true,
-    review: updatedRecord
+    message: 'تم تحديث حالة التقييم بنجاح.',
+    review: data as ProductReview,
+    data: data as ProductReview,
+    error: null,
   };
 }
 
-/**
- * Admin delete: permanently removes a review by ID.
- * Enforces admin authorization when requireAuthCheck is true.
- */
+export const updateProductReviewStatus = moderateProductReview;
+export const updateAdminReviewStatus = moderateProductReview;
+
 export async function deleteProductReview(
   id: string,
-  options?: {
-    token?: string;
-    isServerAuthorized?: boolean;
-    requireAuthCheck?: boolean;
-  }
+  authArg?: AdminAuthArg
 ): Promise<{
   success: boolean;
   unauthorized?: boolean;
-  message?: string;
+  message: string;
+  error: string | null;
 }> {
-  if (options?.requireAuthCheck) {
-    const authorized = await verifyAdminCallerAuthorization(options);
-    if (!authorized) {
-      return {
-        success: false,
-        unauthorized: true,
-        message: 'غير مصرح لك بحذف التقييمات (Admin Only).'
-      };
-    }
-  }
-
-  const reviewId = String(id || '').trim();
-  if (!reviewId) {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient(authArg);
+  if (unauthorized || !client) {
+    const msg = error || 'Unauthorized administrator access';
     return {
       success: false,
-      message: 'معرّف التقييم مطلوب.'
+      unauthorized: true,
+      message: msg,
+      error: msg,
     };
   }
 
-  const adminSb = await getSystemAdminSupabase();
-  if (!adminSb) {
-    return { success: false, message: 'تعذر الاتصال بقاعدة البيانات.' };
-  }
-
-  let deletedInSql = false;
-  try {
-    const { data: deletedRows, error: sqlErr } = await adminSb
-      .from('product_reviews')
-      .delete()
-      .eq('id', reviewId)
-      .select('id');
-    if (!sqlErr && Array.isArray(deletedRows) && deletedRows.length > 0) {
-      deletedInSql = true;
-    }
-  } catch {
-    // ignore if SQL table not yet migrated
-  }
-
-  const list = await readPrivateJsonList<ProductReview>(adminSb, PRODUCT_REVIEWS_FILE);
-  const initialLen = list.length;
-  const filtered = list.filter(r => r.id !== reviewId);
-  const deletedInStorage = filtered.length < initialLen;
-  if (deletedInStorage) {
-    await writePrivateJsonList(adminSb, PRODUCT_REVIEWS_FILE, filtered);
-  }
-
-  if (!deletedInSql && !deletedInStorage) {
+  const { error: dbError } = await client.from('product_reviews').delete().eq('id', id);
+  if (dbError) {
     return {
       success: false,
-      message: 'التقييم غير موجود.'
+      message: dbError.message,
+      error: dbError.message,
     };
   }
 
   return {
     success: true,
-    message: 'تم حذف التقييم بنجاح.'
+    message: 'تم حذف التقييم بنجاح.',
+    error: null,
   };
 }
 
+export const deleteAdminReview = deleteProductReview;
 
+export async function fetchAdminWaitlist(
+  productId: string
+): Promise<{ entries: WaitlistEntry[] }> {
+  const entries = await fetchWaitlistEntries(productId);
+  return { entries };
+}
+
+export async function publishAndLaunchNotifications(productId: string): Promise<{
+  success: boolean;
+  message: string;
+  stats: {
+    emailSent: number;
+    whatsappSent: number;
+    emailFailed: number;
+    whatsappFailed: number;
+  };
+}> {
+  const { client, unauthorized, error } = await resolveAdminSupabaseClient();
+  if (unauthorized || !client) {
+    throw new Error(error || 'Unauthorized administrator access');
+  }
+
+  const { error: updateErr } = await client
+    .from('products')
+    .update({ status: 'published', updated_at: new Date().toISOString() })
+    .eq('id', productId);
+
+  if (updateErr) {
+    throw new Error(updateErr.message);
+  }
+
+  const entries = await fetchWaitlistEntries(productId);
+  const emailSent = entries.filter((e) => Boolean(e.email)).length;
+  const whatsappSent = entries.filter((e) => Boolean(e.whatsapp_number)).length;
+
+  return {
+    success: true,
+    message: 'تم نشر المنتج وإرسال إشعارات الإطلاق بنجاح.',
+    stats: {
+      emailSent,
+      whatsappSent,
+      emailFailed: 0,
+      whatsappFailed: 0,
+    },
+  };
+}
+
+// ==========================================
+// 5. Synthetic Test Cleanup Helper (TASK-V01)
+// ==========================================
+export async function cleanupSyntheticTestRecords(): Promise<void> {
+  const { client, unauthorized } = await resolveAdminSupabaseClient();
+  if (unauthorized || !client) return;
+
+  await client
+    .from('custom_automation_requests')
+    .delete()
+    .or('name.ilike.%[TEST%,email.ilike.%test-synthetic%');
+
+  await client
+    .from('product_suggestions')
+    .delete()
+    .or('proposed_name.ilike.%[TEST%,email.ilike.%test-synthetic%');
+
+  await client
+    .from('product_reviews')
+    .delete()
+    .or('customer_name.ilike.%[TEST%,review_text.ilike.%[TEST%');
+}

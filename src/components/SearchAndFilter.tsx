@@ -41,12 +41,14 @@ const SearchAndFilterComponent: React.FC<SearchAndFilterProps> = ({
           value={searchQuery}
           onChange={e => onSearchChange(e.target.value)}
           placeholder={t.searchPlaceholder}
+          aria-label={t.searchPlaceholder}
           className="w-full ps-11 pe-10 py-3.5 bg-white rounded-2xl border border-slate-200 text-slate-900 placeholder-slate-400 text-sm focus:outline-hidden focus:ring-2 focus:ring-[#2F6BFF]/30 focus:border-[#2F6BFF] shadow-xs hover:border-slate-300 transition-all"
         />
         {searchQuery && (
           <button
             type="button"
             onClick={onClearSearch}
+            aria-label={t.clearSearch}
             className="absolute inset-y-0 end-0 flex items-center pe-3.5 text-slate-400 hover:text-slate-700 cursor-pointer transition-colors"
             title={t.clearSearch}
           >

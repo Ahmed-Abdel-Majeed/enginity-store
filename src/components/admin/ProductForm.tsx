@@ -10,6 +10,7 @@ import {
   validateProductPricing,
   formatEGPPrice
 } from '../../lib/utils';
+import { uploadImageToImgBB } from '../../lib/data-store';
 import { ArrowLeft, Save, Plus, Trash2, Eye, Upload, AlertCircle, Download, FileText, Copy, Check, RefreshCw, AlertTriangle, Tag } from 'lucide-react';
 import { z } from 'zod';
 
@@ -104,6 +105,7 @@ export const ProductForm: React.FC<ProductFormProps> = ({
     initialResolvedPricing.salePriceEgp !== null ? String(initialResolvedPricing.salePriceEgp) : ''
   );
   const [xpayUrl, setXpayUrl] = useState(initialProduct?.xpay_url || '');
+  const [fileUrl, setFileUrl] = useState(initialProduct?.file_url || '');
   const [shortAr, setShortAr] = useState(initialProduct?.short_ar || '');
   const [shortEn, setShortEn] = useState(initialProduct?.short_en || '');
   const [descAr, setDescAr] = useState(initialProduct?.description_ar || '');
@@ -168,61 +170,15 @@ export const ProductForm: React.FC<ProductFormProps> = ({
     }
 
     setUploadingTarget(target);
-    setUploadProgressMsg('جاري رفع الصورة إلى ImgBB ورابط مباشر...');
+    setUploadProgressMsg('جاري رفع الصورة عبر خادم الإدارة الآمن...');
     setFormError('');
 
     let uploadedUrl: string | null = null;
 
     try {
-      // Step 1: Try server upload endpoint
-      const formData = new FormData();
-      formData.append('image', file);
-      formData.append('slug', slug || 'product');
-      formData.append('purpose', target);
-
-      const token = Cookies.get('enginity_sb_token') || localStorage.getItem('enginity_sb_token') || '';
-      const response = await fetch('/api/admin/upload-image', {
-        method: 'POST',
-        headers: {
-          ...(token ? { Authorization: `Bearer ${token}` } : {})
-        },
-        credentials: 'include',
-        body: formData
-      });
-
-      if (response.ok) {
-        const data = await response.json();
-        if (data && data.url) {
-          uploadedUrl = data.url;
-        }
-      }
-    } catch {
-      // Server upload route had network issue, try direct client ImgBB
-    }
-
-    // Step 2: Direct Client Fallback to ImgBB API if server route didn't return URL
-    if (!uploadedUrl) {
-      try {
-        setUploadProgressMsg('جاري المحاولة المباشرة عبر ImgBB API...');
-        const imgbbKey = 'e006ebcf750e5849df32660282d17a9e';
-        const clientForm = new FormData();
-        clientForm.append('image', file);
-        clientForm.append('name', `${slug || 'product'}_${target}_${Date.now()}`);
-
-        const imgbbRes = await fetch(`https://api.imgbb.com/1/upload?key=${imgbbKey}`, {
-          method: 'POST',
-          body: clientForm
-        });
-
-        if (imgbbRes.ok) {
-          const json = await imgbbRes.json();
-          if (json && json.success && json.data && json.data.url) {
-            uploadedUrl = json.data.url;
-          }
-        }
-      } catch (err: any) {
-        console.warn('Direct ImgBB client upload error:', err);
-      }
+      uploadedUrl = await uploadImageToImgBB(file);
+    } catch (err: any) {
+      console.warn('Server ImgBB upload error:', err?.message || err);
     }
 
     if (uploadedUrl) {
@@ -234,7 +190,9 @@ export const ProductForm: React.FC<ProductFormProps> = ({
       setFormError('');
       markDirty();
     } else {
-      setFormError('تعذّر رفع الصورة إلى ImgBB، يرجى التأكد من اتصال النت أو إدخال رابط الصورة المباشر دفقياً.');
+      setFormError(
+        'تعذّر رفع الصورة عبر الخادم الآمن (/api/admin/upload-image). يرجى التأكد من جلسة المشرف أو إدخال رابط الصورة المباشر.'
+      );
     }
 
     setUploadingTarget(null);
@@ -579,6 +537,7 @@ export const ProductForm: React.FC<ProductFormProps> = ({
         original_price_egp: pricingValidation.normalized.original_price_egp,
         sale_price_egp: pricingValidation.normalized.sale_price_egp,
         xpay_url: xpayUrl.trim(),
+        file_url: fileUrl.trim(),
         short_ar: shortAr,
         short_en: shortEn,
         description_ar: descAr,
@@ -1009,13 +968,32 @@ export const ProductForm: React.FC<ProductFormProps> = ({
             <label className="text-xs font-semibold text-slate-300">رابط الدفع المباشر (Payment URL)</label>
             <input
               type="url"
+              dir="ltr"
               value={xpayUrl}
               onChange={e => { setXpayUrl(e.target.value); markDirty(); }}
-              placeholder="https://xpay.app/p/enginity-workflow"
+              placeholder="https://checkout.xpay.app/p/..."
               className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white text-xs font-mono focus:outline-hidden focus:border-blue-500"
             />
             <span className="text-[11px] text-slate-400 block">
               رابط الدفع المباشر المخصص لهذا المنتج (HTTPS). ملاحظة هامة: تأكد أن قيمة رابط الدفع في لوحة XPay تطابق السعر النهائي المستحق بعد الخصم.
+            </span>
+          </div>
+
+          {/* Protected Deliverable File URL (TASK-001) */}
+          <div className="space-y-1.5">
+            <label className="text-xs font-semibold text-slate-300">
+              رابط ملف التسليم بعد الدفع (Protected Deliverable File URL — Admin & Fulfillment Only)
+            </label>
+            <input
+              type="url"
+              dir="ltr"
+              value={fileUrl}
+              onChange={e => { setFileUrl(e.target.value); markDirty(); }}
+              placeholder="https://drive.google.com/... أو رابط تحميل ملف JSON المحمي"
+              className="w-full px-3.5 py-2.5 bg-slate-950 border border-slate-800 rounded-xl text-white text-xs font-mono focus:outline-hidden focus:border-blue-500"
+            />
+            <span className="text-[11px] text-emerald-400/90 block">
+              🔒 محمي عبر جدول <code className="font-mono">product_deliverables</code> ولا يظهر أبداً للزوار في المتجر العام؛ يُرسل فقط للعميل بعد تأكيد الدفع.
             </span>
           </div>
 

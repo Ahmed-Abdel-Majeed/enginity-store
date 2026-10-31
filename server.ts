@@ -4,7 +4,7 @@ dotenv.config({ override: true });
 import express, { Request, Response, NextFunction } from 'express';
 import crypto from 'crypto';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
-import { getEffectiveProductPricing } from './src/lib/utils';
+import { getEffectiveProductPricing } from './src/lib/utils.js';
 import {
   orderInitSchema,
   waitlistSubmissionSchema,
@@ -12,7 +12,7 @@ import {
   productSuggestionSubmissionSchema,
   reviewSubmissionSchema,
   isHoneypotTriggered,
-} from './src/lib/validation';
+} from './src/lib/validation.js';
 
 export const app = express();
 const PORT = Number(runtimePort) || 3000;
@@ -1683,7 +1683,8 @@ app.all('/api/*', (_req: Request, res: Response) => {
 // ==========================================
 async function startServer() {
   if (process.env.NODE_ENV !== 'production') {
-    const { createServer: createViteServer } = await import('vite');
+    const vitePkg = 'vite';
+    const { createServer: createViteServer } = await import(vitePkg);
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: 'spa',

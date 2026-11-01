@@ -210,6 +210,10 @@ export async function getSystemAdminToken(): Promise<string | null> {
 
   const serviceRoleKey = nodeEnv ? nodeEnv[roleKey] : undefined;
   if (serviceRoleKey && serviceRoleKey.trim()) {
+    const parts = serviceRoleKey.trim().split('.');
+    if (parts.length >= 3) {
+      return parts.slice(0, 3).join('.');
+    }
     return serviceRoleKey.trim();
   }
 

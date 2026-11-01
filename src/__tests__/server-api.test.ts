@@ -2,7 +2,7 @@ import { describe, it, expect, beforeAll, afterAll } from 'vitest';
 import crypto from 'crypto';
 import type { Server } from 'http';
 import { app, resetRateLimitsForTesting } from '../../server';
-import { getSystemAdminToken } from '../lib/supabase';
+import { getSystemAdminToken, createAuthenticatedClient } from '../lib/supabase';
 
 describe('Express API Security, Orders & Webhook Verification (TASK-002, TASK-003, TASK-005, TASK-008)', () => {
   let server: Server;
@@ -11,7 +11,18 @@ describe('Express API Security, Orders & Webhook Verification (TASK-002, TASK-00
 
   beforeAll(async () => {
     process.env.XPAY_WEBHOOK_SECRET = 'test_xpay_secret_key_for_hmac';
-    adminToken = await getSystemAdminToken();
+    const candidate = await getSystemAdminToken();
+    if (candidate) {
+      try {
+        const authed = createAuthenticatedClient(candidate);
+        const { data: isAdmin } = await authed.rpc('is_admin');
+        if (isAdmin) {
+          adminToken = candidate;
+        }
+      } catch {
+        adminToken = null;
+      }
+    }
     await new Promise<void>((resolve) => {
       server = app.listen(0, () => {
         const addr = server.address();

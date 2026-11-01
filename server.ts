@@ -299,13 +299,28 @@ function isAllowedXPayUrl(urlString: string): boolean {
   try {
     const parsedUrl = new URL(urlString);
     if (parsedUrl.protocol !== 'https:') return false;
-    const allowedHosts = (
-      process.env.XPAY_ALLOWED_HOSTS ||
-      'checkout.xpay.app,community.xpay.app,xpay.app,staging.xpay.app'
-    )
+    const defaultHosts = [
+      'checkout.xpay.app',
+      'community.xpay.app',
+      'xpay.app',
+      'staging.xpay.app',
+    ];
+    const customHosts = (process.env.XPAY_ALLOWED_HOSTS || '')
       .split(',')
-      .map((h) => h.trim().toLowerCase())
+      .map((h) => {
+        const trimmed = h.trim().toLowerCase();
+        if (!trimmed) return '';
+        if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) {
+          try {
+            return new URL(trimmed).hostname.toLowerCase();
+          } catch {
+            return trimmed;
+          }
+        }
+        return trimmed;
+      })
       .filter(Boolean);
+    const allowedHosts = Array.from(new Set([...defaultHosts, ...customHosts]));
     return allowedHosts.includes(parsedUrl.hostname.toLowerCase());
   } catch {
     return false;

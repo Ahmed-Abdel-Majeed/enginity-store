@@ -49,6 +49,16 @@ import {
 
 import { supabase, isSupabaseConfigured, verifyAdminSession } from './lib/supabase';
 
+// Obscure secret admin path (can also be configured via VITE_ADMIN_SECRET_PATH)
+export const ADMIN_SECRET_SLUG = (
+  (import.meta as any).env?.VITE_ADMIN_SECRET_PATH || 'admin-c84e1b93'
+).replace(/^\/+/, '');
+
+export const isAdminPath = (path: string): boolean => {
+  const clean = path.replace(/^\/+/, '').split('?')[0].split('#')[0];
+  return clean === ADMIN_SECRET_SLUG || clean.startsWith(`${ADMIN_SECRET_SLUG}/`);
+};
+
 export default function App() {
   // Check if Supabase is configured
   if (!isSupabaseConfigured()) {
@@ -135,7 +145,7 @@ export default function App() {
       isInitialSearchSyncRef.current = false;
       return;
     }
-    if (pathname.startsWith('/admin') || isDetailsRoute) return;
+    if (isAdminPath(pathname) || isDetailsRoute) return;
 
     const timer = window.setTimeout(() => {
       const params = new URLSearchParams(window.location.search);
@@ -156,7 +166,7 @@ export default function App() {
 
   const handleSelectCategory = (categoryId: number | null) => {
     setSelectedCategoryId(categoryId);
-    if (pathname.startsWith('/admin') || isDetailsRoute) return;
+    if (isAdminPath(pathname) || isDetailsRoute) return;
 
     const params = new URLSearchParams(window.location.search);
     if (categoryId === null) {
@@ -186,6 +196,15 @@ export default function App() {
   // Parse path & redirects
   useEffect(() => {
     const path = pathname;
+
+    // Obscure & block old obvious /admin route from scanning: redirect to /ar
+    if (path === '/admin' || path === '/admin/' || path.startsWith('/admin/')) {
+      const target = `/ar${window.location.search || ''}`;
+      window.history.replaceState({}, '', target);
+      setPathname('/ar');
+      setLang('ar');
+      return;
+    }
 
     // Root redirect to /ar
     if (path === '/' || path === '') {
@@ -382,8 +401,8 @@ export default function App() {
     }
   };
 
-  // RENDER ADMIN PANEL
-  if (pathname.startsWith('/admin')) {
+  // RENDER ADMIN PANEL (Protected Obscure Secret Slug)
+  if (isAdminPath(pathname)) {
     const adminFallback = (
       <div className="min-h-screen bg-slate-900 flex items-center justify-center p-4 font-cairo text-white">
         <div className="text-center space-y-3">

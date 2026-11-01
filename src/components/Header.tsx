@@ -134,14 +134,6 @@ export const Header: React.FC<HeaderProps> = ({
             <span className="whitespace-nowrap">{t.navContact}</span>
           </a>
 
-          {/* Admin Link */}
-          <a
-            href="/admin"
-            className="w-9 h-9 sm:w-10 sm:h-10 flex items-center justify-center text-slate-500 hover:text-[#2F6BFF] rounded-xl hover:bg-slate-100 transition-colors shrink-0"
-            title={t.adminPanel}
-          >
-            <ShieldCheck className="w-5 h-5" />
-          </a>
 
           {/* Mobile Hamburger Toggle */}
           <button

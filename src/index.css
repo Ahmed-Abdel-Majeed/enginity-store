@@ -1,0 +1,90 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --font-cairo: 'Cairo', 'IBM Plex Sans Arabic', -apple-system, BlinkMacSystemFont, sans-serif;
+    --font-heading: 'Space Grotesk', 'Cairo', sans-serif;
+    --font-mono: 'JetBrains Mono', monospace;
+    --color-brand-navy: #0B1F3A;
+    --color-brand-blue: #2F6BFF;
+    --color-surface-bg: #FAFAFA;
+    --color-card-bg: #FFFFFF;
+  }
+
+  html {
+    scroll-behavior: smooth;
+  }
+
+  body {
+    font-family: var(--font-cairo);
+    background-color: var(--color-surface-bg);
+    color: #0F172A;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    line-height: 1.7;
+  }
+
+  /* Accessible Focus Ring Discipline */
+  *:focus-visible {
+    outline: 2px solid #2F6BFF;
+    outline-offset: 2px;
+  }
+}
+
+/* Typography Utility Classes */
+.font-heading {
+  font-family: var(--font-heading);
+}
+
+.font-cairo {
+  font-family: var(--font-cairo);
+}
+
+.font-mono-code {
+  font-family: var(--font-mono);
+  font-variant-numeric: tabular-nums;
+}
+
+/* RTL / LTR Helpers */
+[dir="rtl"] {
+  text-align: right;
+}
+
+[dir="ltr"] {
+  text-align: left;
+}
+
+/* Design System Surface Tokens */
+.enginity-card {
+  background-color: #ffffff;
+  border: 1px solid rgba(226, 232, 240, 0.9);
+  border-radius: 1rem;
+  transition: all 0.25s cubic-bezier(0.16, 1, 0.3, 1);
+}
+
+.enginity-card:hover {
+  border-color: #2F6BFF;
+  box-shadow: 0 12px 30px -5px rgba(11, 31, 58, 0.08);
+}
+
+.enginity-btn-primary {
+  background-color: #2F6BFF;
+  color: #ffffff;
+  border-radius: 0.75rem;
+  font-weight: 700;
+  transition: all 0.2s ease;
+}
+
+.enginity-btn-primary:hover {
+  background-color: #1a56e8;
+  box-shadow: 0 4px 14px rgba(47, 107, 255, 0.3);
+}
+
+/* Hide scrollbars for clean horizontal swipes */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}

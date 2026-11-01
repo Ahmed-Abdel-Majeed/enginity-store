@@ -1,0 +1,6 @@
+{
+  "name": "Enginity",
+  "description": "Enginity online store: bilingual ready-made n8n workflows marketplace with private admin panel and XPay direct checkout.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
